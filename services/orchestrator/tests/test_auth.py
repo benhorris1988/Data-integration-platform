@@ -80,6 +80,7 @@ def test_read_only_cannot_run_a_job(
     # Sign in as Tom (Read-only)
     r = client.post("/api/auth/dev-session", json={"email": "tom.mwangi@corp.local"})
     assert r.status_code == 200
+    csrf = client.cookies["lb_csrf"]
 
     # Mock the DB lookups the run_now endpoint hits before reaching the
     # role check — it shouldn't matter because the role gate fires first,
@@ -88,7 +89,11 @@ def test_read_only_cannot_run_a_job(
 
     monkeypatch.setattr(dbmod, "fetch_one", lambda *_a, **_kw: {"id": 1, "code": "X", "enabled": True})
 
-    r = client.post("/api/jobs/1/run", json={"run_mode": "manual"})
+    r = client.post(
+        "/api/jobs/1/run",
+        json={"run_mode": "manual"},
+        headers={"X-Lakebridge-Csrf": csrf},
+    )
     assert r.status_code == 403
     assert "Read-only" in r.json()["detail"]
 
@@ -97,6 +102,7 @@ def test_operator_can_run_a_job(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     client.post("/api/auth/dev-session", json={"email": "marcus.hahn@corp.local"})
+    csrf = client.cookies["lb_csrf"]
 
     captured: dict[str, Any] = {}
 
@@ -113,7 +119,11 @@ def test_operator_can_run_a_job(
         dbmod, "fetch_one", lambda *_a, **_kw: {"id": 1, "code": "EXT.TEST", "enabled": True}
     )
 
-    r = client.post("/api/jobs/1/run", json={"run_mode": "manual"})
+    r = client.post(
+        "/api/jobs/1/run",
+        json={"run_mode": "manual"},
+        headers={"X-Lakebridge-Csrf": csrf},
+    )
     assert r.status_code == 202, r.text
     assert r.json() == {"run_id": 42}
     # The server resolved triggered_by from the session, NOT from any
@@ -144,6 +154,37 @@ def test_logout_clears_session(client: TestClient) -> None:
     assert r.status_code == 200
 
     assert client.get("/api/me").status_code == 401
+
+
+def test_csrf_blocks_protected_post_without_header(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Auth endpoints are bootstrap; CSRF applies to protected routes."""
+    # Sign in (this seeds the lb_csrf cookie on the response).
+    client.post("/api/auth/dev-session", json={"email": "priya.iyer@corp.local"})
+    from lakebridge import db as dbmod
+
+    monkeypatch.setattr(dbmod, "fetch_one", lambda *_a, **_kw: {"status": "running", "job_code": "X"})
+
+    # A real protected POST without the X-Lakebridge-Csrf header is rejected.
+    r = client.post("/api/runs/1/cancel")
+    assert r.status_code == 403
+    assert "CSRF" in r.json()["detail"]
+
+
+def test_csrf_passes_with_matching_header(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    client.post("/api/auth/dev-session", json={"email": "priya.iyer@corp.local"})
+    csrf = client.cookies.get("lb_csrf")
+    assert csrf, "middleware should set lb_csrf on every response"
+
+    from lakebridge import db as dbmod
+
+    monkeypatch.setattr(dbmod, "fetch_one", lambda *_a, **_kw: {"status": "running", "job_code": "X"})
+
+    r = client.post("/api/runs/1/cancel", headers={"X-Lakebridge-Csrf": csrf})
+    assert r.status_code == 200
 
 
 def test_auth_config_reflects_mode(client: TestClient) -> None:

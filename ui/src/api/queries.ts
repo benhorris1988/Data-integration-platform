@@ -16,6 +16,7 @@ import type {
   ApiReconRow,
   ApiRun,
   ApiRunError,
+  ApiRunRecon,
   ApiRunStep,
   ApiSource,
   ApiSourceObject,
@@ -129,6 +130,15 @@ export function useRunSteps(runId: number | undefined, refetchMs?: number) {
   return useQuery({
     queryKey: ['run', runId, 'steps'],
     queryFn: () => request<ApiRunStep[]>(`/api/runs/${runId}/steps`),
+    enabled: runId !== undefined,
+    refetchInterval: refetchMs,
+  });
+}
+
+export function useRunRecon(runId: number | undefined, refetchMs?: number) {
+  return useQuery({
+    queryKey: ['run', runId, 'recon'],
+    queryFn: () => request<ApiRunRecon | null>(`/api/runs/${runId}/recon`),
     enabled: runId !== undefined,
     refetchInterval: refetchMs,
   });

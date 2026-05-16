@@ -48,6 +48,9 @@ class _RecordingSink:
             "checksum_match": checksum_match,
         })
 
+    def record_recon_buckets(self, run_id, buckets):
+        self.events.append(("recon.buckets", {"run_id": run_id, "count": len(buckets)}))
+
 
 def _spec(**overrides: Any) -> JobSpec:
     base: dict[str, Any] = dict(
@@ -84,7 +87,20 @@ class _FakeCM:
         return None
 
 
+def _stub_target_buckets(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Tests pass `object()` as the sink connection — bypass the
+    DB-touching part of the bucket comparison so we only exercise the
+    state-machine logic."""
+    monkeypatch.setattr(
+        engine, "_read_target_hash_buckets",
+        lambda *a, **kw: {b: {"count": 0, "xor": "00" * 16} for b in (
+            "00-3F", "40-7F", "80-BF", "C0-FF"
+        )},
+    )
+
+
 def test_happy_path_full_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_target_buckets(monkeypatch)
     sink = _RecordingSink()
     src_conn = object()
     sink_conn = object()
@@ -112,7 +128,7 @@ def test_happy_path_full_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
         nonlocal inserted_total
         inserted_total += len(rows)
         assert run_id == 99
-        return len(rows)
+        return len(rows), []
 
     monkeypatch.setattr(engine.sinks.sqlserver, "open_connection", lambda dsn: sink_conn)
     monkeypatch.setattr(engine.sinks.sqlserver, "truncate", _truncate)
@@ -136,6 +152,7 @@ def test_happy_path_full_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_watermark_delta_tracks_max(monkeypatch: pytest.MonkeyPatch) -> None:
+    _stub_target_buckets(monkeypatch)
     sink = _RecordingSink()
 
     monkeypatch.setattr(engine.sources.oracle, "connect", lambda ep: _FakeCM(object()))
@@ -149,7 +166,9 @@ def test_watermark_delta_tracks_max(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(engine.sources.oracle, "fetch_batches", _fake_batches)
     monkeypatch.setattr(engine.sinks.sqlserver, "open_connection", lambda dsn: object())
     monkeypatch.setattr(engine.sinks.sqlserver, "truncate", lambda *a, **kw: None)
-    monkeypatch.setattr(engine.sinks.sqlserver, "bulk_insert", lambda *a, **kw: len(a[4]))
+    monkeypatch.setattr(
+        engine.sinks.sqlserver, "bulk_insert", lambda *a, **kw: (len(a[4]), [])
+    )
     monkeypatch.setattr(engine.sinks.sqlserver, "target_count", lambda c, s, t, r: 3)
     monkeypatch.setattr(engine.sinks.sqlserver, "commit", lambda c: None)
 
@@ -180,6 +199,41 @@ def test_oracle_failure_marks_run_failed(monkeypatch: pytest.MonkeyPatch) -> Non
         e for e in sink.events if e[0] == "step.finish" and e[1]["status"] == "succeeded"
     ]
     assert finished_succeeded == []
+
+
+def test_quarantined_rows_recorded_as_warnings(monkeypatch: pytest.MonkeyPatch) -> None:
+    """When bulk_insert returns rows it couldn't write, the engine fires
+    on_error(severity='warn', code='LB-QUARANTINE') for each."""
+    _stub_target_buckets(monkeypatch)
+    sink = _RecordingSink()
+
+    monkeypatch.setattr(engine.sources.oracle, "connect", lambda ep: _FakeCM(object()))
+    monkeypatch.setattr(engine.sources.oracle, "count_rows", lambda c, obj, pred: 3)
+
+    def _fake_batches(c, sql, params, batch):
+        yield ["ID", "AMOUNT"], [("1", "ok"), ("2", "bad-value"), ("3", "ok")]
+
+    monkeypatch.setattr(engine.sources.oracle, "fetch_batches", _fake_batches)
+    monkeypatch.setattr(engine.sinks.sqlserver, "open_connection", lambda dsn: object())
+    monkeypatch.setattr(engine.sinks.sqlserver, "truncate", lambda *a, **kw: None)
+
+    # Pretend row 2 didn't fit.
+    def _bulk_insert(_conn, _s, _t, _cols, rows, *, run_id):
+        ok = [r for r in rows if r[1] != "bad-value"]
+        bad = [(r, "numeric value out of range") for r in rows if r[1] == "bad-value"]
+        return len(ok), bad
+
+    monkeypatch.setattr(engine.sinks.sqlserver, "bulk_insert", _bulk_insert)
+    monkeypatch.setattr(engine.sinks.sqlserver, "target_count", lambda c, s, t, r: 2)
+    monkeypatch.setattr(engine.sinks.sqlserver, "commit", lambda c: None)
+
+    result = execute_run(_spec(), run_id=11, target_dsn="DSN", state=sink)
+
+    assert result.status == "succeeded"
+    assert result.rows_loaded == 2
+    quar = [e for e in sink.events if e[0] == "error" and e[1]["code"] == "LB-QUARANTINE"]
+    assert len(quar) == 1
+    assert "numeric value" in quar[0][1]["msg"]
 
 
 def test_cancel_check_aborts(monkeypatch: pytest.MonkeyPatch) -> None:

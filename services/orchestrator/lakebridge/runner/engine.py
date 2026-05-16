@@ -12,6 +12,7 @@ bulk insert).
 from __future__ import annotations
 
 import contextlib
+import json
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -98,6 +99,11 @@ class RunStateSink(Protocol):
         checksum_match: bool,
         threshold_pct: float,
     ) -> None: ...
+    def record_recon_buckets(
+        self,
+        run_id: int,
+        buckets: list[dict[str, Any]],
+    ) -> None: ...
 
 
 # ── Watermark-delta helpers ──────────────────────────────────────────────
@@ -173,6 +179,10 @@ def execute_run(
     target_count = 0
     watermark_after: str | None = None
     failure: tuple[StepName, str, str] | None = None  # (step, code, message)
+    # Source-side row hashes, kept in memory and bucketed at recon time.
+    # Same MD5 the load step writes to lb_source_hash, so the comparison is
+    # over an apples-to-apples fingerprint.
+    _source_row_hashes: list[str] = []
 
     src_conn: Any = None
     sink_conn: Any = None
@@ -222,7 +232,12 @@ def execute_run(
                 raise _Cancelled()
             if not columns_lower:
                 columns_lower = [c.lower() for c in columns]
-            written = sinks.sqlserver.bulk_insert(
+            # Compute and stash the source row hashes for recon. The same
+            # bytes go into lb_source_hash during bulk_insert, so source
+            # and target buckets are over identical fingerprints.
+            for r in rows:
+                _source_row_hashes.append(sinks.sqlserver.row_hash(r))
+            written, quarantined = sinks.sqlserver.bulk_insert(
                 sink_conn,
                 spec.target_schema,
                 spec.target_table,
@@ -231,6 +246,23 @@ def execute_run(
                 run_id=run_id,
             )
             rows_loaded += written
+            for raw_row, reason in quarantined:
+                # The row's values are the source-order tuple — the
+                # operator-visible columns plus the watermark. Carry the
+                # raw row in the payload so the analyst can replay it.
+                state.on_error(
+                    run_id,
+                    "warn",
+                    "LB-QUARANTINE",
+                    "load",
+                    reason,
+                    None,
+                    json.dumps(
+                        {"columns": columns_lower, "row": list(raw_row)},
+                        default=str,
+                        ensure_ascii=False,
+                    ),
+                )
             pct = min(100, int(rows_loaded / source_count * 100)) if source_count > 0 else 100
             state.on_step_progress(run_id, 3, pct, rows_loaded, None)
             state.on_step_progress(run_id, 4, pct, rows_loaded, None)
@@ -257,17 +289,30 @@ def execute_run(
         target_count = sinks.sqlserver.target_count(
             sink_conn, spec.target_schema, spec.target_table, run_scope
         )
-        # MVP: count check only. Hash buckets are a follow-up — they need
-        # canonical column ordering between Oracle and SQL Server and a
-        # cheap server-side hash function (HASHBYTES('MD5', …)).
+        # Hash-bucket reconciliation. Both sides are bucketed by the first
+        # byte of the row's MD5 (the `lb_source_hash` we wrote at load):
+        # 00-3F, 40-7F, 80-BF, C0-FF. Per-bucket fingerprint is the XOR of
+        # all hash bytes in the bucket — order-independent and
+        # collision-resistant for any practical N. A mismatched bucket
+        # tells the operator where to look without scanning the whole
+        # table.
+        source_buckets = _bucket_fingerprints(_source_row_hashes)
+        target_buckets = _read_target_hash_buckets(
+            sink_conn, spec.target_schema, spec.target_table, run_scope
+        )
+        bucket_results = _compare_buckets(source_buckets, target_buckets)
+        all_match = all(b["matched"] for b in bucket_results)
         state.record_recon(
             run_id, spec.job_id, source_count, target_count,
-            checksum_match=(source_count == target_count),
+            checksum_match=(source_count == target_count and all_match),
             threshold_pct=0.0005,
         )
+        state.record_recon_buckets(run_id, bucket_results)
+        drift_buckets = [b["bucket"] for b in bucket_results if not b["matched"]]
         msg = (
             f"source={source_count:,} target={target_count:,} "
             f"variance={source_count - target_count}"
+            + (f" · drift in {','.join(drift_buckets)}" if drift_buckets else "")
         )
         state.on_step_finish(run_id, 5, "recon", "succeeded", msg)
 
@@ -344,6 +389,85 @@ def _column_index(columns_lower: list[str], wm_col: str) -> int | None:
 
 class _Cancelled(Exception):
     """Raised internally when a cancel_check() returns True."""
+
+
+# ── Recon hash buckets ──────────────────────────────────────────────────
+
+
+_BUCKETS: tuple[tuple[str, int, int], ...] = (
+    ("00-3F", 0x00, 0x3F),
+    ("40-7F", 0x40, 0x7F),
+    ("80-BF", 0x80, 0xBF),
+    ("C0-FF", 0xC0, 0xFF),
+)
+
+
+def _bucket_for(first_byte: int) -> str:
+    for name, lo, hi in _BUCKETS:
+        if lo <= first_byte <= hi:
+            return name
+    return "C0-FF"  # unreachable; bytes are 0..255
+
+
+def _bucket_fingerprints(hashes: list[str]) -> dict[str, dict[str, Any]]:
+    """Group hex-MD5 strings into the four buckets and produce a per-bucket
+    (count, xor-fingerprint) summary."""
+    init: dict[str, dict[str, Any]] = {
+        name: {"count": 0, "xor": bytearray(16)} for name, _, _ in _BUCKETS
+    }
+    for h in hashes:
+        digest = bytes.fromhex(h)
+        bucket = _bucket_for(digest[0])
+        cell = init[bucket]
+        cell["count"] = int(cell["count"]) + 1
+        xb: bytearray = cell["xor"]
+        for i in range(16):
+            xb[i] ^= digest[i]
+    return {name: {"count": v["count"], "xor": bytes(v["xor"]).hex()} for name, v in init.items()}
+
+
+def _read_target_hash_buckets(
+    sink_conn: Any, schema: str, table: str, run_id: int | None
+) -> dict[str, dict[str, Any]]:
+    """Stream `lb_source_hash` from the target and bucket it the same way
+    as the source. Same Python helper for byte-identical comparison."""
+    sql = f"SELECT lb_source_hash FROM [{schema}].[{table}]"
+    params: tuple[Any, ...] = ()
+    if run_id is not None:
+        sql += " WHERE lb_run_id = ?"
+        params = (run_id,)
+    hashes: list[str] = []
+    with sink_conn.cursor() as cur:
+        cur.execute(sql, params)
+        for row in cur.fetchall():
+            if row[0]:
+                hashes.append(str(row[0]))
+    return _bucket_fingerprints(hashes)
+
+
+def _compare_buckets(
+    source: dict[str, dict[str, Any]],
+    target: dict[str, dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Produce the per-bucket comparison rows the persistence layer writes
+    into `lakebridge.recon_hash_buckets`."""
+    out: list[dict[str, Any]] = []
+    for name, _, _ in _BUCKETS:
+        s = source.get(name, {"count": 0, "xor": "00" * 16})
+        t = target.get(name, {"count": 0, "xor": "00" * 16})
+        # MD5 is 16 bytes / 32 hex chars; recon_hash_buckets.source_hash is
+        # CHAR(32). The XOR fingerprint is the right shape.
+        out.append(
+            {
+                "bucket": name,
+                "source_count": s["count"],
+                "target_count": t["count"],
+                "source_hash": s["xor"],
+                "target_hash": t["xor"],
+                "matched": s["count"] == t["count"] and s["xor"] == t["xor"],
+            }
+        )
+    return out
 
 
 # ── Convenience for tests / callers that don't want to assemble UTC time ─

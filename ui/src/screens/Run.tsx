@@ -20,6 +20,7 @@ import {
   useRun,
   useRunErrors,
   useRunJob,
+  useRunRecon,
   useRunSteps,
 } from '../api/queries';
 import {
@@ -683,43 +684,106 @@ function RunErrorsTable({
 }
 
 function RunRecon({ run }: { run: ApiRun }) {
-  // Hash-bucket recon isn't wired yet — the orchestrator currently only
-  // records counts (see /db/migrations/0004 + the engine's recon step).
-  // Show the count-based result and leave the hash table as a TODO chip.
+  const recon = useRunRecon(run.id, run.status === 'running' ? 5_000 : undefined);
+
+  if (recon.isPending) {
+    return <SkeletonBlock h={220} />;
+  }
+  if (recon.isError) {
+    return (
+      <InlineBanner
+        tone="danger"
+        title="Could not load reconciliation."
+        description={recon.error instanceof Error ? recon.error.message : 'Unknown error'}
+      />
+    );
+  }
+  if (!recon.data) {
+    return (
+      <EmptyState
+        icon={<I.gitCompareArrows size={20} />}
+        title="Reconciliation pending."
+        description="The recon step runs after the load completes — check back once the run finishes."
+      />
+    );
+  }
+
+  const r = recon.data;
+  const variance = r.variance_rows;
+  const overallTone: 'ok' | 'warn' = r.result === 'ok' ? 'ok' : 'warn';
+
   return (
     <div className="border border-border dark:border-d-border rounded-md bg-surface dark:bg-d-surface">
       <div className="px-4 py-2.5 border-b border-border dark:border-d-border flex items-center justify-between">
         <h3 className="text-base font-medium text-text dark:text-d-text">Reconciliation</h3>
         <span className="text-xs text-text-subtle dark:text-d-text-subtle font-mono tabular">
-          {run.finished_at ? formatRelative(run.finished_at) : 'computing'}
+          {formatRelative(r.computed_at)}
         </span>
       </div>
       <div className="grid grid-cols-3 divide-x divide-border dark:divide-d-border">
         <ReconCol
-          label="Rows loaded"
-          value={formatInt(run.rows_loaded)}
-          sub="target write completed"
+          label="Source rowcount"
+          value={formatInt(r.source_count)}
+          sub="at start of run"
           status="ok"
         />
         <ReconCol
-          label="Errors"
-          value={String(run.error_count)}
-          sub={run.error_count === 0 ? 'clean' : 'see Errors tab'}
-          status={run.error_count > 0 ? 'warn' : 'ok'}
+          label="Target rowcount"
+          value={formatInt(r.target_count)}
+          sub={`written this run`}
+          status={r.target_count === r.source_count ? 'ok' : 'warn'}
         />
         <ReconCol
-          label="Watermark"
-          value={run.watermark_after ?? '—'}
-          sub={run.watermark_after ? 'advanced this run' : 'not applicable'}
-          status="ok"
+          label="Variance"
+          value={
+            variance === 0
+              ? '0 rows'
+              : `${variance > 0 ? '−' : '+'}${formatInt(Math.abs(variance))} rows`
+          }
+          sub={
+            r.source_count > 0
+              ? `${((Math.abs(variance) / r.source_count) * 100).toFixed(4)}% · threshold ${(r.threshold_pct * 100).toFixed(2)}%`
+              : 'no source rows'
+          }
+          status={overallTone}
         />
       </div>
       <div className="px-4 py-3 border-t border-border dark:border-d-border">
-        <InlineBanner
-          tone="info"
-          title="Row-hash check not wired yet."
-          description="Hash bucket reconciliation needs canonical Oracle↔SQL Server column ordering. Schema is ready (lakebridge.recon_hash_buckets); turning on shortly."
-        />
+        <h4 className="text-sm font-medium text-text dark:text-d-text mb-2">
+          Row hash check
+        </h4>
+        {r.buckets.length === 0 ? (
+          <p className="text-xs text-text-muted dark:text-d-text-muted">
+            No bucket data for this run.
+          </p>
+        ) : (
+          <table className="w-full text-sm">
+            <thead>
+              <tr className="text-xs uppercase tracking-wide text-text-muted dark:text-d-text-muted">
+                <th className="text-left py-1.5 font-medium">Bucket</th>
+                <th className="text-right py-1.5 font-medium">Source hash</th>
+                <th className="text-right py-1.5 font-medium">Target hash</th>
+                <th className="text-right py-1.5 font-medium">Match</th>
+              </tr>
+            </thead>
+            <tbody className="font-mono text-xs">
+              {r.buckets.map((b) => (
+                <tr key={b.bucket} className="border-t border-border dark:border-d-border">
+                  <td className="py-1.5 text-text-muted dark:text-d-text-muted">{b.bucket}</td>
+                  <td className="py-1.5 text-right text-text dark:text-d-text">
+                    {b.source_hash.slice(0, 16)}…
+                  </td>
+                  <td className="py-1.5 text-right text-text dark:text-d-text">
+                    {b.target_hash.slice(0, 16)}…
+                  </td>
+                  <td className="py-1.5 text-right">
+                    <StatusDot status={b.matched ? 'succeeded' : 'failed'} />
+                  </td>
+                </tr>
+              ))}
+            </tbody>
+          </table>
+        )}
       </div>
     </div>
   );

@@ -176,7 +176,8 @@ class SqlServerRunStateSink:
         variance = source_count - target_count
         result = "ok"
         if not checksum_match:
-            # variance-only result; refine when hash buckets land
+            # Count-variance grades the result; hash drift always degrades
+            # the verdict to at least 'warn'.
             if source_count == 0:
                 result = "warn" if abs(variance) > 0 else "ok"
             else:
@@ -188,6 +189,28 @@ class SqlServerRunStateSink:
             "VALUES (?, ?, ?, ?, ?, ?, ?)",
             (run_id, job_id, source_count, target_count, checksum_match, result, threshold_pct),
         )
+
+    def record_recon_buckets(
+        self,
+        run_id: int,
+        buckets: list[dict[str, Any]],
+    ) -> None:
+        # Look up the recon_check id we just inserted for this run.
+        row = db.fetch_one(
+            "SELECT TOP 1 id FROM lakebridge.recon_checks WHERE run_id = ? "
+            "ORDER BY computed_at DESC",
+            (run_id,),
+        )
+        if row is None:
+            return
+        recon_id = int(row["id"])
+        for b in buckets:
+            db.execute(
+                "INSERT INTO lakebridge.recon_hash_buckets "
+                "(recon_id, bucket, source_hash, target_hash) "
+                "VALUES (?, ?, ?, ?)",
+                (recon_id, b["bucket"], b["source_hash"], b["target_hash"]),
+            )
 
     @staticmethod
     def encode_payload(value: object) -> str:

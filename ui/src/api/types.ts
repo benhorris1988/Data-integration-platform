@@ -255,6 +255,25 @@ export type ApiSourceObject = {
   last_analyzed: string | null;
 };
 
+// Per-run reconciliation result for the Run detail Recon tab.
+export type ApiReconBucket = {
+  bucket: string;
+  source_hash: string;
+  target_hash: string;
+  matched: boolean;
+};
+
+export type ApiRunRecon = {
+  source_count: number;
+  target_count: number;
+  variance_rows: number;
+  checksum_match: boolean;
+  result: ReconResult;
+  threshold_pct: number;
+  computed_at: string;
+  buckets: ApiReconBucket[];
+};
+
 // One log line from /api/runs/:id/log SSE.
 export type ApiLogLine = {
   run_id: number;

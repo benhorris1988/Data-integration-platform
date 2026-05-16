@@ -42,6 +42,7 @@ def test_openapi_renders_with_all_routers() -> None:
         "/api/runs/{run_id}",
         "/api/runs/{run_id}/events",
         "/api/runs/{run_id}/log",
+        "/api/runs/{run_id}/recon",
         "/api/sources",
         "/api/sources/{source_id}/test-connection",
         "/api/sources/{source_id}/objects",

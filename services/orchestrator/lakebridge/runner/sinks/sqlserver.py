@@ -69,31 +69,73 @@ def bulk_insert(
     rows: list[tuple[Any, ...]],
     *,
     run_id: int,
-) -> int:
+) -> tuple[int, list[tuple[tuple[Any, ...], str]]]:
     """Insert `rows` into the staging table, appending the trailer columns.
 
-    Returns the number of rows written (== `len(rows)` on success, since
-    pyodbc with fast_executemany doesn't surface per-row failures — the
-    whole batch either lands or rolls back).
+    Returns `(loaded_count, quarantined)`:
+        loaded_count — rows successfully inserted into the target
+        quarantined  — list of (row, reason) tuples that could not be inserted.
+                       The caller writes these to `run_errors` with code
+                       `LB-QUARANTINE` and keeps going.
+
+    Strategy:
+        1. Try the fast path: `fast_executemany` over the whole batch.
+        2. If anything fails (a single overflow value rolls back the
+           whole batch on pyodbc), roll back and retry per row, catching
+           the rows that fail and reporting them as quarantined.
+
+    The slow path is only paid when there's bad data — happy-path
+    performance is unchanged.
     """
     if not rows:
-        return 0
+        return 0, []
+
     full_columns = [*columns, *_TRAILER_COLUMNS]
     placeholders = ", ".join("?" for _ in full_columns)
     quoted = ", ".join(f"[{c}]" for c in full_columns)
     sql = f"INSERT INTO [{schema}].[{table}] ({quoted}) VALUES ({placeholders})"
 
-    enriched: list[tuple[Any, ...]] = []
-    for r in rows:
-        h = row_hash(r)
-        # lb_loaded_at is filled by the DEFAULT; we still pass None for
-        # column-positional safety so the SQL doesn't need per-row variants.
-        enriched.append((*r, run_id, None, h, 0, None))
+    def enrich(r: tuple[Any, ...]) -> tuple[Any, ...]:
+        # lb_loaded_at is filled by the table DEFAULT; we still pass None
+        # for column-positional safety.
+        return (*r, run_id, None, row_hash(r), 0, None)
 
+    enriched = [enrich(r) for r in rows]
+
+    # Fast path.
+    try:
+        with conn.cursor() as cur:
+            cur.fast_executemany = True
+            cur.executemany(sql, enriched)
+        return len(rows), []
+    except Exception as fast_exc:
+        # Whole batch rolls back on a single bad row; we drop into per-row
+        # mode to isolate the offenders. Roll back first so the connection
+        # state is clean.
+        import contextlib
+
+        with contextlib.suppress(Exception):
+            conn.rollback()
+        # Best-effort: if the batch is just two rows, the fast-path error
+        # already tells us nearly as much as a per-row probe. We still
+        # iterate so the reason field gets the correct per-row message.
+        _ = fast_exc
+
+    loaded = 0
+    quarantined: list[tuple[tuple[Any, ...], str]] = []
     with conn.cursor() as cur:
-        cur.fast_executemany = True
-        cur.executemany(sql, enriched)
-    return len(rows)
+        for raw, full in zip(rows, enriched, strict=True):
+            try:
+                cur.execute(sql, full)
+                loaded += 1
+            except Exception as row_exc:
+                reason = str(row_exc).splitlines()[0][:200]
+                quarantined.append((raw, reason))
+                # An aborted per-row statement may leave the cursor needing
+                # rollback on some drivers; be defensive.
+                with contextlib.suppress(Exception):
+                    conn.rollback()
+    return loaded, quarantined
 
 
 def commit(conn: Any) -> None:

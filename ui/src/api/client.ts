@@ -19,6 +19,17 @@ export class ApiError extends Error {
 // absolute URL only when the UI is hosted on a different domain than the API.
 const BASE = (import.meta.env.VITE_API_BASE_URL ?? '').replace(/\/$/, '');
 
+function readCookie(name: string): string | null {
+  // document.cookie is one big string of `k=v; k=v` pairs.
+  const prefix = `${name}=`;
+  for (const part of document.cookie.split('; ')) {
+    if (part.startsWith(prefix)) return decodeURIComponent(part.slice(prefix.length));
+  }
+  return null;
+}
+
+const UNSAFE_METHODS = new Set(['POST', 'PUT', 'PATCH', 'DELETE']);
+
 export async function request<T>(
   path: string,
   init: RequestInit = {},
@@ -28,6 +39,15 @@ export async function request<T>(
   if (!headers.has('Accept')) headers.set('Accept', 'application/json');
   if (init.body && !headers.has('Content-Type')) {
     headers.set('Content-Type', 'application/json');
+  }
+
+  // Attach the CSRF token on state-changing requests. The server sets
+  // `lb_csrf` on every response (not httponly so we can read it here),
+  // and the middleware compares this header against the session token.
+  const method = (init.method ?? 'GET').toUpperCase();
+  if (UNSAFE_METHODS.has(method)) {
+    const csrf = readCookie('lb_csrf');
+    if (csrf) headers.set('X-Lakebridge-Csrf', csrf);
   }
 
   const res = await fetch(url, {

@@ -12,6 +12,7 @@ import json
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Request, status
+from pydantic import BaseModel
 from sse_starlette.sse import EventSourceResponse
 
 from .. import auth, db
@@ -75,6 +76,56 @@ def get_errors(
         (run_id,),
     )
     return [RunError.model_validate(r) for r in rows]
+
+
+class ReconHashBucket(BaseModel):
+    bucket: str
+    source_hash: str
+    target_hash: str
+    matched: bool
+
+
+class RunReconResponse(BaseModel):
+    source_count: int
+    target_count: int
+    variance_rows: int
+    checksum_match: bool
+    result: str
+    threshold_pct: float
+    computed_at: str
+    buckets: list[ReconHashBucket]
+
+
+@router.get("/{run_id}/recon", response_model=RunReconResponse | None)
+def get_run_recon(
+    run_id: int,
+    _: Annotated[auth.User, Depends(auth.current_user)],
+) -> RunReconResponse | None:
+    """The reconciliation result for one run, including hash buckets. Returns
+    null if the run hasn't reached the recon step yet."""
+    check = db.fetch_one(
+        "SELECT TOP 1 id, source_count, target_count, variance_rows, checksum_match, "
+        "       result, threshold_pct, computed_at "
+        "FROM lakebridge.recon_checks WHERE run_id = ? ORDER BY computed_at DESC",
+        (run_id,),
+    )
+    if check is None:
+        return None
+    buckets = db.fetch_all(
+        "SELECT bucket, source_hash, target_hash, matched "
+        "FROM lakebridge.recon_hash_buckets WHERE recon_id = ? ORDER BY bucket",
+        (int(check["id"]),),
+    )
+    return RunReconResponse(
+        source_count=int(check["source_count"]),
+        target_count=int(check["target_count"]),
+        variance_rows=int(check["variance_rows"]),
+        checksum_match=bool(check["checksum_match"]),
+        result=str(check["result"]),
+        threshold_pct=float(check["threshold_pct"]),
+        computed_at=str(check["computed_at"]),
+        buckets=[ReconHashBucket.model_validate(b) for b in buckets],
+    )
 
 
 @router.post("/{run_id}/cancel")

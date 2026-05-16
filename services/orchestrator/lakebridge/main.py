@@ -11,6 +11,7 @@ from starlette.middleware.sessions import SessionMiddleware
 
 from .api import audit, auth, dashboard, health, jobs, recon, runs, sources, users
 from .config import get_settings
+from .csrf import CsrfMiddleware
 from .logging import configure, get_logger
 from .scheduler import start_global_scheduler, stop_global_scheduler
 
@@ -51,8 +52,11 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
         allow_credentials=True,
     )
-    # SessionMiddleware before the routers — auth.current_user reads
-    # `request.session` which only exists once this is wired.
+    # Middleware order: outermost wraps everything, so order is
+    # CORS → Session → CSRF → routers. CSRF reads the session, so it
+    # must be added AFTER SessionMiddleware (Starlette executes in
+    # reverse-add order).
+    app.add_middleware(CsrfMiddleware)
     app.add_middleware(
         SessionMiddleware,
         secret_key=s.session_secret,
