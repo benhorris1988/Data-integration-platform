@@ -51,14 +51,18 @@ def connect(ep: OracleEndpoint) -> Iterator[Any]:
             conn.close()
 
 
-def count_rows(conn: Any, source_object: str, predicate_sql: str | None) -> int:
+def count_rows(
+    conn: Any,
+    source_object: str,
+    predicate_sql: str | None,
+    bind_params: dict[str, Any] | None = None,
+) -> int:
     """`SELECT COUNT(*) FROM <obj> [WHERE <predicate>]`."""
     sql = f"SELECT COUNT(*) FROM {source_object}"
-    params: dict[str, Any] = {}
     if predicate_sql:
         sql += f" WHERE {predicate_sql}"
     with conn.cursor() as cur:
-        cur.execute(sql, params)
+        cur.execute(sql, bind_params or {})
         row = cur.fetchone()
         return int(row[0]) if row else 0
 

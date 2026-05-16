@@ -42,14 +42,19 @@ class JobSpec:
     batch_size: int
     watermark_column: str | None
     watermark_before: str | None
+    # Backfill window (only set when the run was queued as run_mode='backfill').
+    # When set, the runner uses these as the WHERE bounds on the source
+    # query and does NOT advance the live watermark on success.
+    backfill_from: str | None = None
+    backfill_to: str | None = None
     # Source connection
-    source_host: str
-    source_port: int
-    source_sid: str | None
-    source_service_name: str | None
-    source_user: str
-    source_password: str
-    source_tls_required: bool
+    source_host: str = ""
+    source_port: int = 1521
+    source_sid: str | None = None
+    source_service_name: str | None = None
+    source_user: str = ""
+    source_password: str = ""
+    source_tls_required: bool = True
 
 
 @dataclass
@@ -109,14 +114,30 @@ class RunStateSink(Protocol):
 # ── Watermark-delta helpers ──────────────────────────────────────────────
 
 
-def _build_extraction_sql(spec: JobSpec) -> tuple[str, dict[str, Any]]:
-    """Compose the SELECT the runner sends to Oracle, plus bound params.
+def _is_backfill(spec: JobSpec) -> bool:
+    return bool(spec.backfill_from and spec.backfill_to)
 
-    If `source_query` is set on the job, use it verbatim (operator's
-    responsibility to bind `:wm` where appropriate). Otherwise, fall back
-    to `SELECT * FROM <source_object>` with an optional watermark predicate.
-    """
+
+def _build_extraction_sql(spec: JobSpec) -> tuple[str, dict[str, Any]]:
+    """Compose the SELECT the runner sends to Oracle, plus bound params."""
     params: dict[str, Any] = {}
+
+    # Backfill takes precedence over the normal watermark predicate. The
+    # bounds are `(from, to]` — inclusive of `from`, exclusive of `to` —
+    # so successive non-overlapping backfills never re-emit the same row.
+    if _is_backfill(spec):
+        if not spec.watermark_column:
+            raise ValueError(
+                f"job {spec.code} backfill requires watermark_column"
+            )
+        sql = (
+            f"SELECT * FROM {spec.source_object} "
+            f"WHERE {spec.watermark_column} >= :wm_from AND {spec.watermark_column} < :wm_to"
+        )
+        params["wm_from"] = spec.backfill_from
+        params["wm_to"] = spec.backfill_to
+        return sql, params
+
     if spec.source_query:
         sql = spec.source_query
         if ":wm" in sql:
@@ -141,6 +162,8 @@ def _build_extraction_sql(spec: JobSpec) -> tuple[str, dict[str, Any]]:
 
 def _predicate_for_count(spec: JobSpec) -> str | None:
     """Return the WHERE-clause body (or None) the count step should apply."""
+    if _is_backfill(spec):
+        return f"{spec.watermark_column} >= :wm_from AND {spec.watermark_column} < :wm_to"
     if spec.strategy != "watermark_delta" or spec.watermark_before is None:
         return None
     return f"{spec.watermark_column} > :wm"
@@ -210,8 +233,17 @@ def execute_run(
         if cancel_check():
             raise _Cancelled()
         state.on_step_start(run_id, 2, "count")
+        count_predicate = _predicate_for_count(spec)
+        count_binds: dict[str, Any] = {}
+        if _is_backfill(spec):
+            count_binds = {"wm_from": spec.backfill_from, "wm_to": spec.backfill_to}
+        elif (
+            spec.strategy == "watermark_delta"
+            and spec.watermark_before is not None
+        ):
+            count_binds = {"wm": spec.watermark_before}
         source_count = sources.oracle.count_rows(
-            src_conn, spec.source_object, _predicate_for_count(spec)
+            src_conn, spec.source_object, count_predicate, count_binds
         )
         state.on_step_finish(
             run_id, 2, "count", "succeeded", f"source rowcount = {source_count:,}"
@@ -318,7 +350,16 @@ def execute_run(
 
         # ── 6. finalize ──────────────────────────────────────────────
         state.on_step_start(run_id, 6, "finalize")
-        if spec.strategy == "watermark_delta" and watermark_after:
+        if _is_backfill(spec):
+            # Backfill runs deliberately don't advance the watermark — they
+            # replay an out-of-band window. Surface the bounds in the step
+            # message for the operator's audit trail.
+            watermark_after = None  # ensure on_run_finish doesn't bump
+            state.on_step_progress(
+                run_id, 6, 100, 0,
+                f"backfill {spec.backfill_from} → {spec.backfill_to} (watermark untouched)",
+            )
+        elif spec.strategy == "watermark_delta" and watermark_after:
             # Persistence layer is responsible for writing back via the
             # state sink — the engine just hands it the value.
             state.on_step_progress(run_id, 6, 100, 0, f"watermark → {watermark_after}")

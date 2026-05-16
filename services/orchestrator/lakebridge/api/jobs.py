@@ -20,9 +20,14 @@ router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
 
 # `triggered_by` is no longer accepted from the client — the server fills
-# it from the session. The body only carries run mode now.
+# it from the session. The body carries run mode and (for backfill) the
+# watermark window to replay.
 class RunNowBody(BaseModel):
     run_mode: str = "manual"  # "manual" | "backfill"
+    # Inclusive lower bound, exclusive upper. Both are required when
+    # run_mode="backfill"; ignored for "manual".
+    backfill_from: str | None = None
+    backfill_to: str | None = None
 
 
 @router.get("", response_model=list[JobListItem])
@@ -310,20 +315,55 @@ def run_now(
     body: RunNowBody,
     user: Annotated[auth.User, Depends(auth.RequireOperator)],
 ) -> dict[str, int]:
-    """Enqueue a run. The scheduler thread picks it up on the next tick."""
+    """Enqueue a run. The scheduler thread picks it up on the next tick.
+
+    For backfill runs, the body must include both `backfill_from` (inclusive
+    lower bound) and `backfill_to` (exclusive upper). The runner uses them
+    as the WHERE predicate on the source query and does NOT advance the
+    live watermark on success — backfills are out-of-band replays.
+    """
     job = db.fetch_one(
-        "SELECT id, code, enabled FROM lakebridge.jobs WHERE id = ?", (job_id,)
+        "SELECT id, code, enabled, strategy FROM lakebridge.jobs WHERE id = ?",
+        (job_id,),
     )
     if job is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
     if not job["enabled"] and body.run_mode != "backfill":
         raise HTTPException(status.HTTP_409_CONFLICT, "job is disabled")
-    run_id = enqueue_run(job_id, triggered_by=user.email, run_mode=body.run_mode)
+    if body.run_mode == "backfill":
+        if job["strategy"] != "watermark_delta":
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "backfill is only valid for watermark_delta jobs",
+            )
+        if not body.backfill_from or not body.backfill_to:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "backfill requires backfill_from and backfill_to",
+            )
+        if body.backfill_from >= body.backfill_to:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "backfill_from must be strictly before backfill_to",
+            )
+    run_id = enqueue_run(
+        job_id,
+        triggered_by=user.email,
+        run_mode=body.run_mode,
+        backfill_from=body.backfill_from if body.run_mode == "backfill" else None,
+        backfill_to=body.backfill_to if body.run_mode == "backfill" else None,
+    )
     auth.audit(
         user,
         "job.run_now",
         str(job["code"]),
-        {"job_id": job_id, "run_id": run_id, "run_mode": body.run_mode},
+        {
+            "job_id": job_id,
+            "run_id": run_id,
+            "run_mode": body.run_mode,
+            "backfill_from": body.backfill_from,
+            "backfill_to": body.backfill_to,
+        },
     )
     return {"run_id": run_id}
 

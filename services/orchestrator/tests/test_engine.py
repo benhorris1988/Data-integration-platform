@@ -109,7 +109,7 @@ def test_happy_path_full_snapshot(monkeypatch: pytest.MonkeyPatch) -> None:
         engine.sources.oracle, "connect", lambda ep: _FakeCM(src_conn)
     )
     monkeypatch.setattr(
-        engine.sources.oracle, "count_rows", lambda c, obj, pred: 4
+        engine.sources.oracle, "count_rows", lambda c, obj, pred, binds=None: 4
     )
 
     def _fake_batches(c, sql, params, batch):
@@ -156,7 +156,7 @@ def test_watermark_delta_tracks_max(monkeypatch: pytest.MonkeyPatch) -> None:
     sink = _RecordingSink()
 
     monkeypatch.setattr(engine.sources.oracle, "connect", lambda ep: _FakeCM(object()))
-    monkeypatch.setattr(engine.sources.oracle, "count_rows", lambda c, obj, pred: 3)
+    monkeypatch.setattr(engine.sources.oracle, "count_rows", lambda c, obj, pred, binds=None: 3)
 
     def _fake_batches(c, sql, params, batch):
         # Mixed order on purpose — engine should keep the lexical max.
@@ -208,7 +208,7 @@ def test_quarantined_rows_recorded_as_warnings(monkeypatch: pytest.MonkeyPatch) 
     sink = _RecordingSink()
 
     monkeypatch.setattr(engine.sources.oracle, "connect", lambda ep: _FakeCM(object()))
-    monkeypatch.setattr(engine.sources.oracle, "count_rows", lambda c, obj, pred: 3)
+    monkeypatch.setattr(engine.sources.oracle, "count_rows", lambda c, obj, pred, binds=None: 3)
 
     def _fake_batches(c, sql, params, batch):
         yield ["ID", "AMOUNT"], [("1", "ok"), ("2", "bad-value"), ("3", "ok")]
@@ -234,6 +234,56 @@ def test_quarantined_rows_recorded_as_warnings(monkeypatch: pytest.MonkeyPatch) 
     quar = [e for e in sink.events if e[0] == "error" and e[1]["code"] == "LB-QUARANTINE"]
     assert len(quar) == 1
     assert "numeric value" in quar[0][1]["msg"]
+
+
+def test_backfill_uses_window_and_skips_watermark_advance(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """A backfill run binds (from, to) to the source query and never
+    advances the live watermark, even when watermark values exist in the
+    extracted rows."""
+    _stub_target_buckets(monkeypatch)
+    sink = _RecordingSink()
+    captured_sql: dict[str, str] = {}
+
+    monkeypatch.setattr(engine.sources.oracle, "connect", lambda ep: _FakeCM(object()))
+    monkeypatch.setattr(engine.sources.oracle, "count_rows", lambda c, obj, pred, binds=None: 2)
+
+    def _fake_batches(_c, sql, params, _batch):
+        captured_sql["sql"] = sql
+        captured_sql["params"] = params  # type: ignore[assignment]
+        yield ["ID", "MODIFIED_DATE"], [
+            ("1", "2026-04-01T10:00:00Z"),
+            ("2", "2026-04-02T10:00:00Z"),
+        ]
+
+    monkeypatch.setattr(engine.sources.oracle, "fetch_batches", _fake_batches)
+    monkeypatch.setattr(engine.sinks.sqlserver, "open_connection", lambda dsn: object())
+    monkeypatch.setattr(engine.sinks.sqlserver, "truncate", lambda *a, **kw: None)
+    monkeypatch.setattr(
+        engine.sinks.sqlserver, "bulk_insert", lambda *a, **kw: (len(a[4]), [])
+    )
+    monkeypatch.setattr(engine.sinks.sqlserver, "target_count", lambda c, s, t, r: 2)
+    monkeypatch.setattr(engine.sinks.sqlserver, "commit", lambda c: None)
+
+    spec = _spec(
+        strategy="watermark_delta",
+        watermark_column="MODIFIED_DATE",
+        watermark_before="2026-05-16T09:00:00Z",
+        backfill_from="2026-04-01T00:00:00Z",
+        backfill_to="2026-04-15T00:00:00Z",
+    )
+    result = execute_run(spec, run_id=21, target_dsn="DSN", state=sink)
+
+    assert result.status == "succeeded"
+    # Backfill must NOT bump the watermark.
+    assert result.watermark_after is None
+    # The extraction SQL used the backfill bounds, not the live watermark.
+    assert ">= :wm_from AND" in captured_sql["sql"]
+    assert captured_sql["params"] == {
+        "wm_from": "2026-04-01T00:00:00Z",
+        "wm_to": "2026-04-15T00:00:00Z",
+    }
 
 
 def test_cancel_check_aborts(monkeypatch: pytest.MonkeyPatch) -> None:

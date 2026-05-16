@@ -90,6 +90,8 @@ class Run(_Base):
     error_count: int
     watermark_before: str | None = None
     watermark_after: str | None = None
+    backfill_from: str | None = None
+    backfill_to: str | None = None
 
 
 class RunStep(_Base):

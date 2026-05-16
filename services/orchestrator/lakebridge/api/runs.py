@@ -22,13 +22,21 @@ from ..models import Run, RunError, RunStep
 router = APIRouter(prefix="/api/runs", tags=["runs"])
 
 
-def enqueue_run(job_id: int, triggered_by: str, run_mode: str) -> int:
+def enqueue_run(
+    job_id: int,
+    triggered_by: str,
+    run_mode: str,
+    *,
+    backfill_from: str | None = None,
+    backfill_to: str | None = None,
+) -> int:
     """Insert a queued run and return its id."""
     with db.connection() as conn, conn.cursor() as cur:
         cur.execute(
-            "INSERT INTO lakebridge.runs (job_id, status, triggered_by, run_mode) "
-            "OUTPUT INSERTED.id VALUES (?, ?, ?, ?)",
-            (job_id, "queued", triggered_by, run_mode),
+            "INSERT INTO lakebridge.runs "
+            "(job_id, status, triggered_by, run_mode, backfill_from, backfill_to) "
+            "OUTPUT INSERTED.id VALUES (?, ?, ?, ?, ?, ?)",
+            (job_id, "queued", triggered_by, run_mode, backfill_from, backfill_to),
         )
         new_id = int(cur.fetchone()[0])
         conn.commit()

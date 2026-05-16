@@ -214,7 +214,8 @@ def _claim_queued_runs(n: int, claimer: str) -> list[dict[str, Any]]:
         return []
     placeholders = ", ".join("?" for _ in claimed_ids)
     return db.fetch_all(
-        f"SELECT id, job_id, triggered_by FROM lakebridge.runs WHERE id IN ({placeholders})",
+        "SELECT id, job_id, triggered_by, run_mode, backfill_from, backfill_to "
+        f"FROM lakebridge.runs WHERE id IN ({placeholders})",
         tuple(claimed_ids),
     )
 
@@ -257,6 +258,8 @@ def _build_job_spec(run: dict[str, Any]) -> JobSpec | None:
         batch_size=int(j["batch_size"]),
         watermark_column=j["watermark_column"],
         watermark_before=j["watermark_before"],
+        backfill_from=run.get("backfill_from"),
+        backfill_to=run.get("backfill_to"),
         source_host=str(j["host"]),
         source_port=int(j["port"]),
         source_sid=j["sid"],

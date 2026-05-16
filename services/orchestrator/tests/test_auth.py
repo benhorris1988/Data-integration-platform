@@ -106,9 +106,18 @@ def test_operator_can_run_a_job(
 
     captured: dict[str, Any] = {}
 
-    def fake_enqueue(job_id: int, triggered_by: str, run_mode: str) -> int:
+    def fake_enqueue(
+        job_id: int,
+        triggered_by: str,
+        run_mode: str,
+        *,
+        backfill_from: str | None = None,
+        backfill_to: str | None = None,
+    ) -> int:
         captured["triggered_by"] = triggered_by
         captured["run_mode"] = run_mode
+        captured["backfill_from"] = backfill_from
+        captured["backfill_to"] = backfill_to
         return 42
 
     from lakebridge import db as dbmod
@@ -129,6 +138,76 @@ def test_operator_can_run_a_job(
     # The server resolved triggered_by from the session, NOT from any
     # client-supplied field.
     assert captured["triggered_by"] == "marcus.hahn@corp.local"
+
+
+def test_backfill_validation(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Backfill requires watermark_delta strategy + both window bounds."""
+    client.post("/api/auth/dev-session", json={"email": "priya.iyer@corp.local"})
+    csrf = client.cookies["lb_csrf"]
+    from lakebridge import db as dbmod
+    from lakebridge.api import jobs as jobs_api
+
+    captured: dict[str, Any] = {}
+
+    def fake_enqueue(*_a: Any, **kw: Any) -> int:
+        captured.update(kw)
+        return 1
+
+    monkeypatch.setattr(jobs_api, "enqueue_run", fake_enqueue)
+
+    # 1. Backfill on a full_snapshot job is rejected.
+    monkeypatch.setattr(
+        dbmod, "fetch_one",
+        lambda *_a, **_kw: {"id": 1, "code": "X", "enabled": True, "strategy": "full_snapshot"},
+    )
+    r = client.post(
+        "/api/jobs/1/run",
+        json={"run_mode": "backfill", "backfill_from": "a", "backfill_to": "b"},
+        headers={"X-Lakebridge-Csrf": csrf},
+    )
+    assert r.status_code == 400
+    assert "watermark_delta" in r.json()["detail"]
+
+    # 2. Missing window bounds rejected.
+    monkeypatch.setattr(
+        dbmod, "fetch_one",
+        lambda *_a, **_kw: {"id": 1, "code": "X", "enabled": True, "strategy": "watermark_delta"},
+    )
+    r = client.post(
+        "/api/jobs/1/run",
+        json={"run_mode": "backfill"},
+        headers={"X-Lakebridge-Csrf": csrf},
+    )
+    assert r.status_code == 400
+
+    # 3. Inverted window rejected.
+    r = client.post(
+        "/api/jobs/1/run",
+        json={
+            "run_mode": "backfill",
+            "backfill_from": "2026-05-16",
+            "backfill_to": "2026-05-01",
+        },
+        headers={"X-Lakebridge-Csrf": csrf},
+    )
+    assert r.status_code == 400
+
+    # 4. Happy path: window forwarded to enqueue_run unchanged.
+    r = client.post(
+        "/api/jobs/1/run",
+        json={
+            "run_mode": "backfill",
+            "backfill_from": "2026-05-01T00:00:00Z",
+            "backfill_to": "2026-05-16T00:00:00Z",
+        },
+        headers={"X-Lakebridge-Csrf": csrf},
+    )
+    assert r.status_code == 202
+    assert captured["backfill_from"] == "2026-05-01T00:00:00Z"
+    assert captured["backfill_to"] == "2026-05-16T00:00:00Z"
+    assert captured["run_mode"] == "backfill"
 
 
 def test_admin_only_endpoints_reject_operator(

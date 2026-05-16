@@ -54,6 +54,7 @@ export function JobDetail({
   const runJob = useRunJob();
   const toggleJob = useToggleJob();
   const [tab, setTab] = useState<'config' | 'schema' | 'history' | 'watermarks'>('config');
+  const [backfillOpen, setBackfillOpen] = useState(false);
 
   if (job.isError) {
     return (
@@ -124,6 +125,18 @@ export function JobDetail({
             >
               {j?.enabled ? 'Disable' : 'Enable'}
             </Button>
+            {j?.strategy === 'watermark_delta' && (
+              <Button
+                variant="ghost"
+                size="md"
+                iconLeft={<I.history size={14} />}
+                disabled={!canWrite}
+                title={canWrite ? undefined : 'Read-only role'}
+                onClick={() => setBackfillOpen(true)}
+              >
+                Backfill…
+              </Button>
+            )}
             <Button
               variant="primary"
               size="md"
@@ -172,6 +185,118 @@ export function JobDetail({
             <JobHistory jobId={j.id} jobCode={j.code} onOpenRun={onOpenRun} />
           )}
           {tab === 'watermarks' && j && <JobWatermarks job={j} />}
+        </div>
+      </div>
+      {backfillOpen && j && (
+        <BackfillDialog
+          job={j}
+          onClose={() => setBackfillOpen(false)}
+          onQueued={(runId) => {
+            setBackfillOpen(false);
+            toast.push({
+              tone: 'success',
+              title: `Backfill queued for ${j.code}`,
+              description: `Run #${runId}`,
+            });
+            onOpenRun?.({ runId, jobCode: j.code });
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function BackfillDialog({
+  job,
+  onClose,
+  onQueued,
+}: {
+  job: ApiJob;
+  onClose: () => void;
+  onQueued: (runId: number) => void;
+}) {
+  const toast = useToast();
+  const runJob = useRunJob();
+  // Default to a 7-day window ending yesterday — operators most often
+  // backfill recent gaps left by a bad upstream change.
+  const yesterday = new Date(Date.now() - 24 * 3600_000);
+  const weekBefore = new Date(yesterday.getTime() - 7 * 24 * 3600_000);
+  const toIso = (d: Date) => d.toISOString().slice(0, 10);
+  const [from, setFrom] = useState(toIso(weekBefore));
+  const [to, setTo] = useState(toIso(yesterday));
+  const error = !from || !to ? 'Both bounds required.' : from >= to ? 'From must be before To.' : null;
+
+  return (
+    <div className="fixed inset-0 z-50 bg-black/30 dark:bg-black/60 flex items-center justify-center">
+      <div className="w-[480px] bg-surface dark:bg-d-surface border border-border dark:border-d-border rounded-md shadow-overlay dark:shadow-overlay-dark">
+        <div className="px-4 py-3 border-b border-border dark:border-d-border">
+          <h3 className="text-base font-medium text-text dark:text-d-text">
+            Backfill {job.code}
+          </h3>
+          <p className="mt-1 text-xs text-text-muted dark:text-d-text-muted">
+            Replays rows where <span className="font-mono">{job.watermark_column}</span> is
+            in <span className="font-mono">[from, to)</span>. The live watermark is not
+            advanced — this is an out-of-band replay.
+          </p>
+        </div>
+        <div className="px-4 py-4 space-y-3">
+          <label className="block">
+            <span className="text-xs uppercase tracking-wide text-text-muted dark:text-d-text-muted">
+              From (inclusive)
+            </span>
+            <input
+              type="date"
+              value={from}
+              onChange={(e) => setFrom(e.target.value)}
+              className="mt-1 w-full h-9 px-2 rounded-sm border border-border-strong dark:border-d-border-strong bg-surface dark:bg-d-surface text-sm font-mono"
+            />
+          </label>
+          <label className="block">
+            <span className="text-xs uppercase tracking-wide text-text-muted dark:text-d-text-muted">
+              To (exclusive)
+            </span>
+            <input
+              type="date"
+              value={to}
+              onChange={(e) => setTo(e.target.value)}
+              className="mt-1 w-full h-9 px-2 rounded-sm border border-border-strong dark:border-d-border-strong bg-surface dark:bg-d-surface text-sm font-mono"
+            />
+          </label>
+          {error && <p className="text-xs text-warning">{error}</p>}
+        </div>
+        <div className="px-4 py-3 border-t border-border dark:border-d-border flex items-center justify-end gap-2">
+          <Button variant="ghost" size="md" onClick={onClose}>
+            Cancel
+          </Button>
+          <Button
+            variant="primary"
+            size="md"
+            disabled={!!error}
+            loading={runJob.isPending}
+            onClick={() =>
+              runJob.mutate(
+                {
+                  jobId: job.id,
+                  runMode: 'backfill',
+                  // Send wall-clock dates as ISO timestamps so the runner
+                  // can pass them straight to the Oracle bind.
+                  backfillFrom: `${from}T00:00:00Z`,
+                  backfillTo: `${to}T00:00:00Z`,
+                },
+                {
+                  onSuccess: (data) => onQueued(data.run_id),
+                  onError: (err: unknown) =>
+                    toast.push({
+                      tone: 'danger',
+                      title: 'Backfill rejected',
+                      description: err instanceof Error ? err.message : 'Unknown error',
+                    }),
+                },
+              )
+            }
+          >
+            Queue backfill
+          </Button>
         </div>
       </div>
     </div>

@@ -85,13 +85,21 @@ export function useRunJob() {
     mutationFn: ({
       jobId,
       runMode = 'manual',
+      backfillFrom,
+      backfillTo,
     }: {
       jobId: number;
       runMode?: 'manual' | 'backfill';
+      backfillFrom?: string;
+      backfillTo?: string;
     }) =>
       request<{ run_id: number }>(`/api/jobs/${jobId}/run`, {
         method: 'POST',
-        body: JSON.stringify({ run_mode: runMode }),
+        body: JSON.stringify({
+          run_mode: runMode,
+          backfill_from: backfillFrom,
+          backfill_to: backfillTo,
+        }),
       }),
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: ['jobs'] });
