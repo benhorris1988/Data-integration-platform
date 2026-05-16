@@ -1,24 +1,50 @@
-import { useState } from 'react';
+import { useMemo, useState } from 'react';
 import { cx } from '../lib/cx';
 import { I } from '../lib/icons';
-import { Button, Sparkline, StatusDot, Tag } from '../components/primitives';
 import {
-  ERRORS,
-  JOBS,
-  SPARK_ACTIVE,
-  SPARK_ROWS,
-  SPARK_RUNS,
-  SPARK_SUCC,
-  TIMELINE_BLOCKS,
-  type Job,
-} from '../data/sample';
+  Button,
+  InlineBanner,
+  SkeletonBlock,
+  Sparkline,
+  StatusDot,
+  Tag,
+} from '../components/primitives';
+import {
+  useDashboardErrors,
+  useDashboardKpis,
+  useDashboardTimeline,
+  useJobs,
+} from '../api/queries';
+import { formatInt, formatPercent, formatRelative } from '../api/format';
+import type { ApiTimelineEntry, RunStatus } from '../api/types';
+import type { JobRef, RunRef } from '../App';
 
 type Props = {
-  onOpenJob?: (j: Job) => void;
-  onOpenRun?: (j?: Job) => void;
+  onOpenJob?: (ref: JobRef) => void;
+  onOpenRun?: (ref?: RunRef) => void;
 };
 
 export function Dashboard({ onOpenRun }: Props) {
+  const kpis = useDashboardKpis();
+  const timeline = useDashboardTimeline();
+  const errors = useDashboardErrors(10);
+  const jobs = useJobs();
+
+  const refreshAll = () => {
+    kpis.refetch();
+    timeline.refetch();
+    errors.refetch();
+    jobs.refetch();
+  };
+
+  const isLoading = kpis.isPending;
+  const isError = kpis.isError;
+  const k = kpis.data;
+
+  const running = (jobs.data ?? []).filter(
+    (j) => j.last_run_status === 'running' || j.last_run_status === 'queued',
+  );
+
   return (
     <div className="flex flex-col h-full">
       <div className="px-8 pt-6 pb-4 border-b border-border dark:border-d-border bg-bg dark:bg-d-bg">
@@ -32,12 +58,25 @@ export function Dashboard({ onOpenRun }: Props) {
             </p>
           </div>
           <div className="flex items-center gap-2">
-            <span className="text-xs text-text-subtle dark:text-d-text-subtle inline-flex items-center gap-1.5">
-              <span className="inline-block w-1.5 h-1.5 rounded-full bg-success lb-pulse" />
-              All systems nominal
-            </span>
+            {isError ? (
+              <span className="text-xs text-danger inline-flex items-center gap-1.5">
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-danger" />
+                Metrics unavailable
+              </span>
+            ) : (
+              <span className="text-xs text-text-subtle dark:text-d-text-subtle inline-flex items-center gap-1.5">
+                <span className="inline-block w-1.5 h-1.5 rounded-full bg-success lb-pulse" />
+                Live · refreshes every 30s
+              </span>
+            )}
             <div className="w-px h-5 bg-border dark:bg-d-border" />
-            <Button variant="ghost" size="md" iconLeft={<I.refresh size={14} />}>
+            <Button
+              variant="ghost"
+              size="md"
+              iconLeft={<I.refresh size={14} />}
+              loading={kpis.isFetching || timeline.isFetching || errors.isFetching}
+              onClick={refreshAll}
+            >
               Refresh
             </Button>
             <Button variant="secondary" size="md" iconLeft={<I.calendar size={14} />}>
@@ -48,37 +87,53 @@ export function Dashboard({ onOpenRun }: Props) {
       </div>
 
       <div className="flex-1 min-h-0 overflow-auto px-8 py-4 space-y-4">
+        {isError && (
+          <InlineBanner
+            tone="danger"
+            title="Could not load dashboard."
+            description={kpis.error instanceof Error ? kpis.error.message : 'Unknown error'}
+            action={
+              <Button
+                variant="secondary"
+                size="sm"
+                iconLeft={<I.refresh size={12} />}
+                onClick={refreshAll}
+              >
+                Retry
+              </Button>
+            }
+          />
+        )}
+
         <div className="grid grid-cols-4 gap-4">
           <Kpi
             label="Runs (24h)"
-            value="1,284"
-            delta="+8.2%"
-            deltaTone="success"
-            series={SPARK_RUNS}
+            value={k ? formatInt(k.runs_24h) : '—'}
+            series={k?.series_runs ?? []}
             color="#2563EB"
+            loading={isLoading}
           />
           <Kpi
             label="Success rate"
-            value="98.4%"
-            delta="−0.4 pp"
-            deltaTone="warning"
-            series={SPARK_SUCC}
+            value={k ? formatPercent(k.success_rate_pct) : '—'}
+            series={k?.series_success ?? []}
             color="#16A34A"
+            loading={isLoading}
           />
           <Kpi
             label="Rows landed"
-            value="184.2M"
-            delta="+12.1%"
-            deltaTone="success"
-            series={SPARK_ROWS}
+            value={k ? formatRowsCompact(k.rows_landed_24h) : '—'}
+            series={k?.series_rows ?? []}
             color="#0891B2"
+            loading={isLoading}
           />
           <Kpi
             label="Active jobs"
-            value="18 / 28"
-            sub="10 paused"
-            series={SPARK_ACTIVE}
+            value={k ? `${k.active_jobs} / ${k.active_jobs + k.paused_jobs}` : '—'}
+            sub={k ? `${k.paused_jobs} paused` : undefined}
+            series={k?.series_active ?? []}
             color="#71717A"
+            loading={isLoading}
           />
         </div>
 
@@ -95,42 +150,20 @@ export function Dashboard({ onOpenRun }: Props) {
                 <LegendDot color="bg-brand" label="Running" />
               </div>
             </div>
-            <Timeline24h />
+            <Timeline24h
+              entries={timeline.data ?? []}
+              isLoading={timeline.isPending}
+            />
           </div>
 
           <div className="col-span-4 border border-border dark:border-d-border rounded-md bg-surface dark:bg-d-surface">
             <div className="px-4 py-2.5 border-b border-border dark:border-d-border flex items-center justify-between">
-              <h3 className="text-base font-medium text-text dark:text-d-text">Strategy mix</h3>
-              <span className="text-xs text-text-subtle dark:text-d-text-subtle">runs · 24h</span>
+              <h3 className="text-base font-medium text-text dark:text-d-text">
+                Strategy mix
+              </h3>
+              <span className="text-xs text-text-subtle dark:text-d-text-subtle">jobs</span>
             </div>
-            <div className="p-4 space-y-3">
-              {(
-                [
-                  ['watermark_delta', 682, 'bg-brand'],
-                  ['append', 401, 'bg-info'],
-                  ['full_snapshot', 144, 'bg-text-subtle'],
-                  ['truncate_and_load', 57, 'bg-warning'],
-                ] as const
-              ).map(([name, n, color]) => {
-                const pct = (n / 1284) * 100;
-                return (
-                  <div key={name}>
-                    <div className="flex items-center justify-between text-sm">
-                      <span className="font-mono text-text dark:text-d-text">{name}</span>
-                      <span className="tabular text-text-muted dark:text-d-text-muted">
-                        {n}{' '}
-                        <span className="text-text-subtle dark:text-d-text-subtle">
-                          ({pct.toFixed(0)}%)
-                        </span>
-                      </span>
-                    </div>
-                    <div className="mt-1 h-1.5 bg-surface-2 dark:bg-d-surface-2 rounded-sm overflow-hidden">
-                      <div className={cx('h-full', color)} style={{ width: pct + '%' }} />
-                    </div>
-                  </div>
-                );
-              })}
-            </div>
+            <StrategyMix jobs={jobs.data ?? []} isLoading={jobs.isPending} />
           </div>
         </div>
 
@@ -147,41 +180,57 @@ export function Dashboard({ onOpenRun }: Props) {
                 View all
               </Button>
             </div>
-            <table className="w-full text-sm" style={{ tableLayout: 'fixed' }}>
-              <colgroup>
-                <col style={{ width: 44 }} />
-                <col style={{ width: 150 }} />
-                <col style={{ width: 220 }} />
-                <col />
-                <col style={{ width: 100 }} />
-              </colgroup>
-              <tbody>
-                {ERRORS.slice(0, 10).map((e) => (
-                  <tr
-                    key={e.id}
-                    onClick={() => onOpenRun?.()}
-                    className={cx(
-                      'border-t border-border dark:border-d-border cursor-pointer hover:bg-surface-2 dark:hover:bg-d-surface-2',
-                    )}
-                    style={{ height: 32 }}
-                  >
-                    <td className="px-3">
-                      <StatusDot status={e.severity === 'error' ? 'failed' : 'warning'} />
-                    </td>
-                    <td className="px-3 font-mono text-sm text-text dark:text-d-text">{e.code}</td>
-                    <td className="px-3 font-mono text-xs text-text-muted dark:text-d-text-muted">
-                      {e.job_code}
-                    </td>
-                    <td className="px-3 truncate text-text-muted dark:text-d-text-muted">
-                      {e.message}
-                    </td>
-                    <td className="px-3 text-right text-xs text-text-muted dark:text-d-text-muted">
-                      {e.captured_at}
-                    </td>
-                  </tr>
+            {errors.isPending ? (
+              <div className="p-4 space-y-2">
+                {Array.from({ length: 6 }).map((_, i) => (
+                  <SkeletonBlock key={i} h={20} />
                 ))}
-              </tbody>
-            </table>
+              </div>
+            ) : errors.data && errors.data.length > 0 ? (
+              <table className="w-full text-sm" style={{ tableLayout: 'fixed' }}>
+                <colgroup>
+                  <col style={{ width: 44 }} />
+                  <col style={{ width: 150 }} />
+                  <col style={{ width: 220 }} />
+                  <col />
+                  <col style={{ width: 100 }} />
+                </colgroup>
+                <tbody>
+                  {errors.data.map((e) => (
+                    <tr
+                      key={e.id}
+                      onClick={() => onOpenRun?.({ runId: e.run_id, jobCode: e.job_code })}
+                      className={cx(
+                        'border-t border-border dark:border-d-border cursor-pointer hover:bg-surface-2 dark:hover:bg-d-surface-2',
+                      )}
+                      style={{ height: 32 }}
+                    >
+                      <td className="px-3">
+                        <StatusDot
+                          status={e.severity === 'error' ? 'failed' : 'warning'}
+                        />
+                      </td>
+                      <td className="px-3 font-mono text-sm text-text dark:text-d-text">
+                        {e.code}
+                      </td>
+                      <td className="px-3 font-mono text-xs text-text-muted dark:text-d-text-muted">
+                        {e.job_code}
+                      </td>
+                      <td className="px-3 truncate text-text-muted dark:text-d-text-muted">
+                        {e.message}
+                      </td>
+                      <td className="px-3 text-right text-xs text-text-muted dark:text-d-text-muted">
+                        {formatRelative(e.captured_at)}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            ) : (
+              <div className="px-4 py-10 text-center text-sm text-text-muted dark:text-d-text-muted">
+                No errors in the recent window.
+              </div>
+            )}
           </div>
 
           <div className="col-span-4 border border-border dark:border-d-border rounded-md bg-surface dark:bg-d-surface">
@@ -190,40 +239,44 @@ export function Dashboard({ onOpenRun }: Props) {
                 Currently running
               </h3>
               <span className="text-xs text-text-subtle dark:text-d-text-subtle tabular">
-                3 jobs
+                {running.length} job{running.length === 1 ? '' : 's'}
               </span>
             </div>
             <div>
-              {JOBS.filter((j) => j.status === 'running' || j.status === 'queued')
-                .slice(0, 3)
-                .concat([JOBS[5], JOBS[9]])
-                .slice(0, 3)
-                .map((j, i) => (
+              {running.length === 0 ? (
+                <div className="px-4 py-10 text-center text-sm text-text-muted dark:text-d-text-muted">
+                  Nothing running right now.
+                </div>
+              ) : (
+                running.slice(0, 4).map((j) => (
                   <div
                     key={j.id}
-                    onClick={() => onOpenRun?.(j)}
+                    onClick={() =>
+                      j.last_run_id != null &&
+                      onOpenRun?.({ runId: j.last_run_id, jobCode: j.code })
+                    }
                     className="px-4 py-2.5 border-t border-border dark:border-d-border first:border-t-0 hover:bg-surface-2 dark:hover:bg-d-surface-2 cursor-pointer"
                   >
                     <div className="flex items-center justify-between">
-                      <span className="font-mono text-sm text-text dark:text-d-text">{j.code}</span>
+                      <span className="font-mono text-sm text-text dark:text-d-text">
+                        {j.code}
+                      </span>
                       <span className="text-xs text-text-muted dark:text-d-text-muted tabular">
-                        {['00:42', '00:18', '01:12'][i]}
+                        {j.last_run_status}
                       </span>
                     </div>
                     <div className="mt-1.5 h-1.5 bg-surface-2 dark:bg-d-surface-2 rounded-sm overflow-hidden">
-                      <div
-                        className="h-full bg-brand lb-pulse"
-                        style={{ width: ['62%', '24%', '88%'][i] }}
-                      />
+                      <div className="h-full bg-brand lb-pulse" style={{ width: '40%' }} />
                     </div>
                     <div className="mt-1 flex items-center justify-between text-xs text-text-muted dark:text-d-text-muted">
-                      <span>step: {['extract', 'count', 'load'][i]}</span>
+                      <span>{j.target_schema}.{j.target_table}</span>
                       <span className="tabular">
-                        {['18,420', '—', '142,810'][i]} rows
+                        {j.last_run_rows ? formatInt(j.last_run_rows) : '—'} rows
                       </span>
                     </div>
                   </div>
-                ))}
+                ))
+              )}
             </div>
           </div>
         </div>
@@ -235,28 +288,18 @@ export function Dashboard({ onOpenRun }: Props) {
 function Kpi({
   label,
   value,
-  delta,
-  deltaTone,
   sub,
   series,
   color,
+  loading,
 }: {
   label: string;
   value: string;
-  delta?: string;
-  deltaTone?: 'success' | 'warning' | 'danger';
   sub?: string;
   series: number[];
   color: string;
+  loading: boolean;
 }) {
-  const dColor =
-    deltaTone === 'success'
-      ? 'text-success'
-      : deltaTone === 'warning'
-      ? 'text-warning'
-      : deltaTone === 'danger'
-      ? 'text-danger'
-      : 'text-text-muted dark:text-d-text-muted';
   return (
     <div className="border border-border dark:border-d-border rounded-md bg-surface dark:bg-d-surface p-4">
       <div className="flex items-start justify-between">
@@ -264,21 +307,23 @@ function Kpi({
           <div className="text-xs text-text-muted dark:text-d-text-muted uppercase tracking-wide">
             {label}
           </div>
-          <div className="mt-1.5 text-2xl font-semibold tabular text-text dark:text-d-text">
-            {value}
-          </div>
+          {loading ? (
+            <div className="mt-1.5">
+              <SkeletonBlock w={120} h={28} />
+            </div>
+          ) : (
+            <div className="mt-1.5 text-2xl font-semibold tabular text-text dark:text-d-text">
+              {value}
+            </div>
+          )}
         </div>
-        {delta && (
-          <span
-            className={cx('text-xs font-medium inline-flex items-center gap-0.5 tabular', dColor)}
-          >
-            {deltaTone === 'success' ? <I.arrowUp size={12} /> : <I.arrowDown size={12} />}
-            {delta.replace(/^[+−]/, '')}
-          </span>
-        )}
       </div>
       <div className="mt-2 -mx-1">
-        <Sparkline data={series} color={color} height={36} />
+        {series.length > 0 ? (
+          <Sparkline data={series} color={color} height={36} />
+        ) : (
+          <SkeletonBlock h={36} />
+        )}
       </div>
       {sub && (
         <div className="text-xs text-text-subtle dark:text-d-text-subtle mt-1">{sub}</div>
@@ -296,12 +341,106 @@ function LegendDot({ color, label }: { color: string; label: string }) {
   );
 }
 
-function Timeline24h() {
+function StrategyMix({
+  jobs,
+  isLoading,
+}: {
+  jobs: { strategy: string }[];
+  isLoading: boolean;
+}) {
+  const counts = useMemo(() => {
+    const m = new Map<string, number>();
+    for (const j of jobs) m.set(j.strategy, (m.get(j.strategy) ?? 0) + 1);
+    return Array.from(m.entries()).sort((a, b) => b[1] - a[1]);
+  }, [jobs]);
+  const total = jobs.length;
+  const colorFor = (s: string) =>
+    ({
+      watermark_delta: 'bg-brand',
+      append: 'bg-info',
+      full_snapshot: 'bg-text-subtle',
+      truncate_and_load: 'bg-warning',
+    }[s] ?? 'bg-surface-2');
+
+  if (isLoading) {
+    return (
+      <div className="p-4 space-y-3">
+        {Array.from({ length: 4 }).map((_, i) => (
+          <SkeletonBlock key={i} h={20} />
+        ))}
+      </div>
+    );
+  }
+  if (total === 0) {
+    return (
+      <div className="px-4 py-10 text-center text-sm text-text-muted dark:text-d-text-muted">
+        No jobs yet.
+      </div>
+    );
+  }
+  return (
+    <div className="p-4 space-y-3">
+      {counts.map(([name, n]) => {
+        const pct = (n / total) * 100;
+        return (
+          <div key={name}>
+            <div className="flex items-center justify-between text-sm">
+              <span className="font-mono text-text dark:text-d-text">{name}</span>
+              <span className="tabular text-text-muted dark:text-d-text-muted">
+                {n}{' '}
+                <span className="text-text-subtle dark:text-d-text-subtle">
+                  ({pct.toFixed(0)}%)
+                </span>
+              </span>
+            </div>
+            <div className="mt-1 h-1.5 bg-surface-2 dark:bg-d-surface-2 rounded-sm overflow-hidden">
+              <div className={cx('h-full', colorFor(name))} style={{ width: pct + '%' }} />
+            </div>
+          </div>
+        );
+      })}
+    </div>
+  );
+}
+
+function Timeline24h({
+  entries,
+  isLoading,
+}: {
+  entries: ApiTimelineEntry[];
+  isLoading: boolean;
+}) {
   const [hover, setHover] = useState<number | null>(null);
-  const colorOf = (s: string) =>
-    ({ succeeded: 'bg-success', warning: 'bg-warning', failed: 'bg-danger', running: 'bg-brand' }[
-      s
-    ] || 'bg-surface-2');
+  const colorOf = (s: RunStatus | 'warning') =>
+    ({
+      succeeded: 'bg-success',
+      warning: 'bg-warning',
+      failed: 'bg-danger',
+      cancelled: 'bg-text-subtle',
+      running: 'bg-brand',
+      queued: 'bg-info',
+    }[s] ?? 'bg-surface-2');
+
+  if (isLoading) {
+    return (
+      <div className="p-4">
+        <SkeletonBlock h={96} />
+      </div>
+    );
+  }
+  if (entries.length === 0) {
+    return (
+      <div className="px-4 py-10 text-center text-sm text-text-muted dark:text-d-text-muted">
+        No runs in the last 24h.
+      </div>
+    );
+  }
+
+  const counts = entries.reduce<Record<string, number>>((acc, e) => {
+    acc[e.status] = (acc[e.status] ?? 0) + 1;
+    return acc;
+  }, {});
+
   return (
     <div className="p-4">
       <div className="relative">
@@ -311,12 +450,13 @@ function Timeline24h() {
           ))}
         </div>
         <div className="flex gap-[2px] items-end h-20 bg-surface-2 dark:bg-d-surface-2 rounded-sm p-1 border border-border dark:border-d-border">
-          {TIMELINE_BLOCKS.map((b, i) => {
-            const heightPct = 30 + (b.dur_sec / 270) * 70;
+          {entries.map((b, i) => {
+            const maxDur = entries.reduce((m, e) => Math.max(m, e.dur_sec ?? 0), 60);
+            const heightPct = 30 + ((b.dur_sec ?? 30) / maxDur) * 70;
             const isHover = hover === i;
             return (
               <div
-                key={i}
+                key={b.id}
                 onMouseEnter={() => setHover(i)}
                 onMouseLeave={() => setHover(null)}
                 className={cx(
@@ -331,16 +471,20 @@ function Timeline24h() {
             );
           })}
         </div>
-        {hover !== null && (
+        {hover !== null && entries[hover] && (
           <div
             className="absolute bg-text text-surface dark:bg-d-text dark:text-d-bg text-xs rounded-sm px-2 py-1 font-mono pointer-events-none whitespace-nowrap z-10"
-            style={{ left: `${(hover / 60) * 100}%`, top: -8, transform: 'translate(-50%, -100%)' }}
+            style={{
+              left: `${(hover / entries.length) * 100}%`,
+              top: -8,
+              transform: 'translate(-50%, -100%)',
+            }}
           >
-            {TIMELINE_BLOCKS[hover].job_code}
+            {entries[hover].job_code}
             <span className="text-text-subtle dark:text-d-text-subtle"> · </span>
-            {TIMELINE_BLOCKS[hover].dur_sec}s
+            {entries[hover].dur_sec ?? '—'}s
             <span className="text-text-subtle dark:text-d-text-subtle"> · </span>
-            {TIMELINE_BLOCKS[hover].status}
+            {entries[hover].status}
           </div>
         )}
       </div>
@@ -348,10 +492,10 @@ function Timeline24h() {
       <div className="mt-3 grid grid-cols-4 gap-4 text-sm">
         {(
           [
-            ['Succeeded', TIMELINE_BLOCKS.filter((b) => b.status === 'succeeded').length, 'text-success'],
-            ['Warning', TIMELINE_BLOCKS.filter((b) => b.status === 'warning').length, 'text-warning'],
-            ['Failed', TIMELINE_BLOCKS.filter((b) => b.status === 'failed').length, 'text-danger'],
-            ['Running', TIMELINE_BLOCKS.filter((b) => b.status === 'running').length, 'text-brand'],
+            ['Succeeded', counts['succeeded'] ?? 0, 'text-success'],
+            ['Failed', counts['failed'] ?? 0, 'text-danger'],
+            ['Running', counts['running'] ?? 0, 'text-brand'],
+            ['Other', (counts['cancelled'] ?? 0) + (counts['queued'] ?? 0), 'text-text-muted'],
           ] as const
         ).map(([k, n, c]) => (
           <div key={k}>
@@ -364,4 +508,11 @@ function Timeline24h() {
       </div>
     </div>
   );
+}
+
+function formatRowsCompact(n: number): string {
+  if (n >= 1_000_000_000) return `${(n / 1_000_000_000).toFixed(1)}B`;
+  if (n >= 1_000_000) return `${(n / 1_000_000).toFixed(1)}M`;
+  if (n >= 1_000) return `${(n / 1_000).toFixed(1)}K`;
+  return String(n);
 }

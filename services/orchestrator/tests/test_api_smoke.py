@@ -31,6 +31,7 @@ def test_openapi_renders_with_all_routers() -> None:
         "/api/health",
         "/api/jobs",
         "/api/jobs/{job_id}",
+        "/api/jobs/{job_id}/runs",
         "/api/runs/{run_id}",
         "/api/runs/{run_id}/events",
         "/api/sources",

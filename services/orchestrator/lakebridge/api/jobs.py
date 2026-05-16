@@ -7,7 +7,7 @@ from typing import Any
 from fastapi import APIRouter, HTTPException, Query, status
 
 from .. import db
-from ..models import Job, JobListItem, RunTriggerRequest
+from ..models import Job, JobListItem, Run, RunTriggerRequest
 from .runs import enqueue_run
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
@@ -61,6 +61,17 @@ def get_job(job_id: int) -> Job:
     if row is None:
         raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
     return Job.model_validate(row)
+
+
+@router.get("/{job_id}/runs", response_model=list[Run])
+def list_job_runs(job_id: int, limit: int = Query(default=50, le=500)) -> list[Run]:
+    """Run history for one job, newest first."""
+    rows = db.fetch_all(
+        f"SELECT TOP {limit} * FROM lakebridge.v_runs_with_job "
+        "WHERE job_id = ? ORDER BY triggered_at DESC",
+        (job_id,),
+    )
+    return [Run.model_validate(r) for r in rows]
 
 
 @router.post("/{job_id}/run", status_code=status.HTTP_202_ACCEPTED)

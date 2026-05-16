@@ -15,66 +15,99 @@ import {
   useClickAway,
   useToast,
 } from '../components/primitives';
-import { JOBS, SOURCES, type Job, type RunStatus } from '../data/sample';
-
-type StateMode = 'live' | 'loading' | 'empty' | 'error' | 'partial';
+import {
+  useJobs,
+  useRunJob,
+  useSources,
+  useToggleJob,
+  type JobsFilters,
+} from '../api/queries';
+import { formatInt, formatRelative } from '../api/format';
+import type { ApiJobListItem, RunStatus } from '../api/types';
+import type { JobRef } from '../App';
 
 type Props = {
-  onOpenJob?: (j: Job) => void;
-  onOpenRun?: (j: Job) => void;
+  onOpenJob?: (ref: JobRef) => void;
+  onOpenRun?: (ref: { runId: number; jobCode?: string }) => void;
 };
+
+// The signed-in operator drives `triggered_by` on manual runs. Once auth is
+// wired we read this from the JWT/session; for now it's a placeholder.
+const CURRENT_OPERATOR = 'priya.iyer';
+
+type SortKey =
+  | 'code'
+  | 'source_object'
+  | 'target_table'
+  | 'strategy'
+  | 'schedule'
+  | 'last_run_finished_at'
+  | 'last_run_rows'
+  | 'last_run_status';
 
 export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
   const toast = useToast();
-  const [stateMode, setStateMode] = useState<StateMode>('live');
   const [density, setDensity] = useState<'default' | 'compact'>('default');
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<Set<RunStatus>>(new Set());
   const [scheduleFilter, setScheduleFilter] = useState<'all' | 'scheduled' | 'manual'>('all');
   const [sourceFilter, setSourceFilter] = useState<string>('all');
-  const [sort, setSort] = useState<{ key: keyof Job; dir: 'asc' | 'desc' }>({
-    key: 'last_run',
+  const [sort, setSort] = useState<{ key: SortKey; dir: 'asc' | 'desc' }>({
+    key: 'last_run_finished_at',
     dir: 'desc',
   });
-  const [selection, setSelection] = useState<Set<string>>(new Set());
-  const [hoverRow, setHoverRow] = useState<string | null>(null);
+  const [selection, setSelection] = useState<Set<number>>(new Set());
+  const [hoverRow, setHoverRow] = useState<number | null>(null);
+
+  const filters: JobsFilters = useMemo(
+    () => ({
+      status: statusFilter.size ? Array.from(statusFilter) : undefined,
+      schedule: scheduleFilter === 'all' ? undefined : scheduleFilter,
+      sourceId: sourceFilter === 'all' ? undefined : sourceFilter,
+      q: query.trim() || undefined,
+    }),
+    [statusFilter, scheduleFilter, sourceFilter, query],
+  );
+
+  const jobs = useJobs(filters);
+  const runJob = useRunJob();
+  const toggleJob = useToggleJob();
 
   const rows = useMemo(() => {
-    let r = JOBS.slice();
-    if (statusFilter.size) r = r.filter((j) => statusFilter.has(j.status));
-    if (scheduleFilter !== 'all') {
-      r = r.filter((j) =>
-        scheduleFilter === 'manual' ? j.schedule === 'manual' : j.schedule !== 'manual',
-      );
-    }
-    if (sourceFilter !== 'all') r = r.filter((j) => j.source === sourceFilter);
-    if (query.trim()) {
-      const q = query.toLowerCase();
-      r = r.filter(
-        (j) =>
-          j.code.toLowerCase().includes(q) ||
-          j.source_object.toLowerCase().includes(q) ||
-          j.target_table.toLowerCase().includes(q),
-      );
-    }
+    const data = jobs.data ?? [];
     const { key, dir } = sort;
-    const cmp = (a: Job, b: Job) => {
-      let av: number | string = a[key] as number | string;
-      let bv: number | string = b[key] as number | string;
-      if (key === 'last_run') {
-        av = JOBS.indexOf(a);
-        bv = JOBS.indexOf(b);
+    const get = (j: ApiJobListItem): string | number | null => {
+      switch (key) {
+        case 'code':
+          return j.code;
+        case 'source_object':
+          return j.source_object;
+        case 'target_table':
+          return j.target_table;
+        case 'strategy':
+          return j.strategy;
+        case 'schedule':
+          return j.schedule;
+        case 'last_run_status':
+          return j.last_run_status ?? '';
+        case 'last_run_finished_at':
+          return j.last_run_finished_at ? Date.parse(j.last_run_finished_at) : 0;
+        case 'last_run_rows':
+          return j.last_run_rows ?? 0;
       }
+    };
+    const cmp = (a: ApiJobListItem, b: ApiJobListItem) => {
+      const av = get(a);
+      const bv = get(b);
       if (typeof av === 'number' && typeof bv === 'number') return av - bv;
       return String(av).localeCompare(String(bv));
     };
-    r.sort((a, b) => (dir === 'asc' ? cmp(a, b) : -cmp(a, b)));
-    return r;
-  }, [statusFilter, scheduleFilter, sourceFilter, query, sort]);
+    return [...data].sort((a, b) => (dir === 'asc' ? cmp(a, b) : -cmp(a, b)));
+  }, [jobs.data, sort]);
 
   const onSort = (k: string) =>
     setSort((s) => ({
-      key: k as keyof Job,
+      key: k as SortKey,
       dir: s.key === k ? (s.dir === 'asc' ? 'desc' : 'asc') : 'asc',
     }));
 
@@ -87,7 +120,7 @@ export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
     });
   };
 
-  const toggleRow = (id: string) => {
+  const toggleRow = (id: number) => {
     setSelection((prev) => {
       const n = new Set(prev);
       if (n.has(id)) n.delete(id);
@@ -101,6 +134,45 @@ export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
 
   const rowH = density === 'compact' ? 28 : 36;
 
+  const handleRunNow = (j: ApiJobListItem) => {
+    runJob.mutate(
+      { jobId: j.id, triggeredBy: CURRENT_OPERATOR },
+      {
+        onSuccess: (data) => {
+          toast.push({
+            tone: 'success',
+            title: `Queued ${j.code}`,
+            description: `Run #${data.run_id} will appear in Run detail.`,
+          });
+          onOpenRun?.({ runId: data.run_id, jobCode: j.code });
+        },
+        onError: (err: unknown) =>
+          toast.push({
+            tone: 'danger',
+            title: `Could not queue ${j.code}`,
+            description: err instanceof Error ? err.message : 'Unknown error',
+          }),
+      },
+    );
+  };
+
+  const handleToggleEnabled = (j: ApiJobListItem) => {
+    toggleJob.mutate(
+      { jobId: j.id, enabled: !j.enabled },
+      {
+        onSuccess: () =>
+          toast.push({
+            tone: 'info',
+            title: j.enabled ? `Disabled ${j.code}` : `Enabled ${j.code}`,
+          }),
+      },
+    );
+  };
+
+  const totalJobs = jobs.data?.length ?? 0;
+  const isLoading = jobs.isPending;
+  const isError = jobs.isError;
+
   return (
     <div className="flex flex-col h-full">
       {/* Page header */}
@@ -111,16 +183,21 @@ export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
               Jobs
             </h1>
             <span className="text-sm text-text-muted dark:text-d-text-muted tabular">
-              {rows.length} of {JOBS.length}
+              {isLoading ? '…' : `${rows.length} of ${totalJobs}`}
             </span>
+            {jobs.isFetching && !jobs.isPending && (
+              <span className="text-xs text-text-subtle dark:text-d-text-subtle">
+                refreshing…
+              </span>
+            )}
           </div>
           <div className="flex items-center gap-2">
-            <StateModePicker value={stateMode} onChange={setStateMode} />
             <Button
               variant="ghost"
               size="md"
               iconLeft={<I.refresh size={14} />}
-              onClick={() => toast.push({ tone: 'info', title: 'Refreshed jobs list' })}
+              loading={jobs.isFetching}
+              onClick={() => jobs.refetch()}
             >
               Refresh
             </Button>
@@ -130,10 +207,9 @@ export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
               iconLeft={<I.plus size={14} />}
               onClick={() =>
                 toast.push({
-                  tone: 'success',
-                  title: 'Job created',
-                  description: 'EXT.NEW.JOB.DRAFT — awaiting source binding.',
-                  duration: 6000,
+                  tone: 'info',
+                  title: 'Job authoring not wired yet',
+                  description: 'POST /api/jobs hasn’t been built; use migrations for now.',
                 })
               }
             >
@@ -168,22 +244,6 @@ export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
         </div>
       </div>
 
-      {/* Partial degradation banner */}
-      {stateMode === 'partial' && (
-        <div className="px-8 pt-3">
-          <InlineBanner
-            tone="warning"
-            title="Metrics service is degraded."
-            description="The Jobs list loaded from the primary database, but row-counts and last-run timing are stale (last sync 14 min ago)."
-            action={
-              <Button variant="secondary" size="sm">
-                Retry
-              </Button>
-            }
-          />
-        </div>
-      )}
-
       {/* Batch toolbar */}
       {selection.size > 0 && (
         <div className="px-8 pt-3">
@@ -203,13 +263,17 @@ export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
                 variant="ghost"
                 size="sm"
                 iconLeft={<I.play size={12} />}
-                onClick={() =>
+                onClick={() => {
+                  const targets = rows.filter((r) => selection.has(r.id));
+                  targets.forEach((j) =>
+                    runJob.mutate({ jobId: j.id, triggeredBy: CURRENT_OPERATOR }),
+                  );
                   toast.push({
                     tone: 'info',
-                    title: `${selection.size} jobs queued`,
+                    title: `${targets.length} jobs queued`,
                     description: 'Runs will start when capacity is available.',
-                  })
-                }
+                  });
+                }}
               >
                 Run now
               </Button>
@@ -219,15 +283,6 @@ export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
               <Button variant="ghost" size="sm" iconLeft={<I.pin size={12} />}>
                 Pin
               </Button>
-              <div className="w-px h-5 bg-border dark:bg-d-border mx-1" />
-              <Button
-                variant="ghost"
-                size="sm"
-                iconLeft={<I.x size={12} />}
-                className="text-danger hover:bg-danger/10 hover:text-danger"
-              >
-                Delete
-              </Button>
             </div>
           </div>
         </div>
@@ -236,14 +291,23 @@ export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
       {/* Table region */}
       <div className="flex-1 min-h-0 px-8 pt-3 pb-4 overflow-auto">
         <div className="border border-border dark:border-d-border rounded-md overflow-hidden bg-surface dark:bg-d-surface">
-          {stateMode === 'error' ? (
+          {isError ? (
             <div className="p-3">
               <InlineBanner
                 tone="danger"
                 title="Could not load jobs."
-                description="Connection to lakebridge-api timed out after 30s. Last successful sync 4 min ago. Showing cached list is disabled per policy."
+                description={
+                  jobs.error instanceof Error
+                    ? jobs.error.message
+                    : 'Connection to lakebridge-api failed.'
+                }
                 action={
-                  <Button variant="secondary" size="sm" iconLeft={<I.refresh size={12} />}>
+                  <Button
+                    variant="secondary"
+                    size="sm"
+                    iconLeft={<I.refresh size={12} />}
+                    onClick={() => jobs.refetch()}
+                  >
                     Retry
                   </Button>
                 }
@@ -273,7 +337,7 @@ export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
                       className="w-3.5 h-3.5 accent-brand cursor-pointer"
                     />
                   </th>
-                  <ThSort k="status" sort={sort.key} dir={sort.dir} onSort={onSort}>
+                  <ThSort k="last_run_status" sort={sort.key} dir={sort.dir} onSort={onSort}>
                     Status
                   </ThSort>
                   <ThSort k="code" sort={sort.key} dir={sort.dir} onSort={onSort}>
@@ -291,11 +355,11 @@ export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
                   <ThSort k="schedule" sort={sort.key} dir={sort.dir} onSort={onSort}>
                     Schedule
                   </ThSort>
-                  <ThSort k="last_run" sort={sort.key} dir={sort.dir} onSort={onSort}>
+                  <ThSort k="last_run_finished_at" sort={sort.key} dir={sort.dir} onSort={onSort}>
                     Last finished
                   </ThSort>
                   <ThSort
-                    k="rows"
+                    k="last_run_rows"
                     sort={sort.key}
                     dir={sort.dir}
                     onSort={onSort}
@@ -307,12 +371,12 @@ export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
                 </tr>
               </thead>
               <tbody>
-                {stateMode === 'loading' &&
+                {isLoading &&
                   Array.from({ length: 14 }).map((_, i) => (
                     <SkeletonJobRow key={i} rowH={rowH} />
                   ))}
 
-                {stateMode === 'empty' && (
+                {!isLoading && rows.length === 0 && totalJobs === 0 && (
                   <tr>
                     <td colSpan={10} className="bg-surface dark:bg-d-surface">
                       <EmptyState
@@ -329,7 +393,7 @@ export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
                   </tr>
                 )}
 
-                {(stateMode === 'live' || stateMode === 'partial') && rows.length === 0 && (
+                {!isLoading && rows.length === 0 && totalJobs > 0 && (
                   <tr>
                     <td colSpan={10} className="bg-surface dark:bg-d-surface">
                       <EmptyState
@@ -355,16 +419,17 @@ export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
                   </tr>
                 )}
 
-                {(stateMode === 'live' || stateMode === 'partial') &&
-                  rows.map((j, i) => {
+                {!isLoading &&
+                  rows.map((j) => {
                     const selected = selection.has(j.id);
+                    const status = j.last_run_status ?? 'queued';
                     return (
                       <tr
                         key={j.id}
                         style={{ height: rowH }}
                         onMouseEnter={() => setHoverRow(j.id)}
                         onMouseLeave={() => setHoverRow(null)}
-                        onClick={() => onOpenJob?.(j)}
+                        onClick={() => onOpenJob?.({ jobId: j.id, jobCode: j.code })}
                         className={cx(
                           'border-b border-border dark:border-d-border cursor-pointer transition-colors',
                           selected
@@ -381,7 +446,7 @@ export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
                           />
                         </td>
                         <td className="px-3">
-                          <StatusBadge status={j.status} dense />
+                          <StatusBadge status={status} dense />
                         </td>
                         <td className="px-3">
                           <span className="font-mono text-sm text-text dark:text-d-text">
@@ -395,7 +460,7 @@ export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
                         </td>
                         <td className="px-3 min-w-0">
                           <span className="font-mono text-sm text-text-muted dark:text-d-text-muted truncate block">
-                            {j.target_table}
+                            {j.target_schema}.{j.target_table}
                           </span>
                         </td>
                         <td className="px-3">
@@ -414,16 +479,16 @@ export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
                           </span>
                         </td>
                         <td className="px-3">
-                          <Hint label={absTime(i)}>
+                          <Hint label={j.last_run_finished_at ?? '—'}>
                             <span className="text-sm text-text-muted dark:text-d-text-muted">
-                              {j.last_run}
+                              {formatRelative(j.last_run_finished_at)}
                             </span>
                           </Hint>
                         </td>
                         <td className="px-3 text-right">
                           <span className="text-sm tabular text-text dark:text-d-text">
-                            {j.rows > 0 ? (
-                              j.rows.toLocaleString('en-US')
+                            {(j.last_run_rows ?? 0) > 0 ? (
+                              formatInt(j.last_run_rows)
                             ) : (
                               <span className="text-text-subtle dark:text-d-text-subtle">—</span>
                             )}
@@ -445,24 +510,26 @@ export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
                                   {
                                     label: 'Run now',
                                     icon: <I.play size={14} />,
-                                    onClick: () =>
-                                      toast.push({
-                                        tone: 'success',
-                                        title: `Queued ${j.code}`,
-                                        description: 'Run will appear in the activity panel.',
-                                      }),
+                                    onClick: () => handleRunNow(j),
                                   },
                                   {
                                     label: 'View latest run',
                                     icon: <I.externalLink size={14} />,
-                                    onClick: () => onOpenRun?.(j),
+                                    onClick: () =>
+                                      j.last_run_id != null &&
+                                      onOpenRun?.({ runId: j.last_run_id, jobCode: j.code }),
                                   },
                                   { label: 'Edit configuration', icon: <I.pencil size={14} /> },
-                                  { label: 'Copy code', icon: <I.copy size={14} />, kbd: '⌘C' },
+                                  { label: 'Copy code', icon: <I.copy size={14} />, kbd: '⌘C',
+                                    onClick: () => {
+                                      navigator.clipboard?.writeText(j.code);
+                                      toast.push({ tone: 'info', title: 'Copied to clipboard' });
+                                    } },
                                   { divider: true },
                                   {
                                     label: j.enabled ? 'Disable job' : 'Enable job',
                                     icon: <I.pause size={14} />,
+                                    onClick: () => handleToggleEnabled(j),
                                   },
                                   { label: 'Delete', icon: <I.x size={14} />, danger: true },
                                 ]}
@@ -486,12 +553,12 @@ export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
         </div>
 
         {/* Footer */}
-        {(stateMode === 'live' || stateMode === 'partial') && rows.length > 0 && (
+        {!isLoading && !isError && rows.length > 0 && (
           <div className="mt-3 flex items-center justify-between text-xs text-text-muted dark:text-d-text-muted">
             <div>
               Showing{' '}
               <span className="tabular text-text dark:text-d-text">{rows.length}</span> of{' '}
-              <span className="tabular">{JOBS.length}</span> jobs
+              <span className="tabular">{totalJobs}</span> jobs
             </div>
             <div className="flex items-center gap-1">
               <Button variant="ghost" size="sm" iconLeft={<I.chevronLeft size={12} />}>
@@ -598,10 +665,11 @@ function SourceSelect({
   value: string;
   onChange: (v: string) => void;
 }) {
+  const sources = useSources();
   return (
     <Select value={value} onChange={(e) => onChange(e.target.value)}>
       <option value="all">All sources</option>
-      {SOURCES.map((s) => (
+      {(sources.data ?? []).map((s) => (
         <option key={s.id} value={s.id}>
           {s.id}
         </option>
@@ -631,33 +699,6 @@ function DensityToggle({
           )}
         >
           {v === 'default' ? 'Default' : 'Compact'}
-        </button>
-      ))}
-    </div>
-  );
-}
-
-function StateModePicker({
-  value,
-  onChange,
-}: {
-  value: StateMode;
-  onChange: (v: StateMode) => void;
-}) {
-  return (
-    <div className="inline-flex rounded-sm border border-border dark:border-d-border overflow-hidden text-xs">
-      {(['live', 'loading', 'empty', 'error', 'partial'] as const).map((v) => (
-        <button
-          key={v}
-          onClick={() => onChange(v)}
-          className={cx(
-            'px-2 h-7 font-medium capitalize transition-colors',
-            v === value
-              ? 'bg-text text-surface dark:bg-d-text dark:text-d-bg'
-              : 'bg-surface text-text-muted hover:text-text dark:bg-d-surface dark:text-d-text-muted dark:hover:text-d-text',
-          )}
-        >
-          {v}
         </button>
       ))}
     </div>
@@ -706,10 +747,4 @@ function truncMid(s: string, max = 32): string {
   if (s.length <= max) return s;
   const half = Math.floor((max - 1) / 2);
   return s.slice(0, half) + '…' + s.slice(s.length - half);
-}
-
-function absTime(i: number): string {
-  const hh = String((14 - (i % 6) + 24) % 24).padStart(2, '0');
-  const mm = String(((42 - (i * 7)) % 60 + 60) % 60).padStart(2, '0');
-  return `2026-05-16 ${hh}:${mm}:11 UTC`;
 }

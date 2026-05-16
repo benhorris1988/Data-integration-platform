@@ -18,7 +18,7 @@ import {
   ToastProvider,
   useClickAway,
 } from './components/primitives';
-import { JOBS, SOURCES, type Job } from './data/sample';
+import { useHealth, useJobs, useSources } from './api/queries';
 import { JobsIndex } from './screens/Jobs';
 import { RunDetail } from './screens/Run';
 import { Dashboard } from './screens/Dashboard';
@@ -39,7 +39,20 @@ type RouteName =
   | 'recon'
   | 'settings';
 
-type Route = { name: RouteName; job?: Job };
+// Routes carry only the small handle a destination screen needs to bootstrap.
+// The screen itself fetches the full detail via TanStack Query.
+export type JobRef = { jobId: number; jobCode: string };
+export type RunRef = { runId: number; jobCode?: string };
+
+type Route =
+  | { name: 'dashboard' }
+  | { name: 'jobs' }
+  | { name: 'job-detail'; ref: JobRef }
+  | { name: 'runs'; ref?: RunRef }
+  | { name: 'sources' }
+  | { name: 'recon' }
+  | { name: 'settings' };
+
 type Theme = 'light' | 'dark';
 
 type NavItem = { key: RouteName; label: string; icon: ComponentType<LucideProps> };
@@ -86,8 +99,12 @@ export default function App() {
     return () => document.removeEventListener('keydown', h);
   }, []);
 
-  const navTo = (name: RouteName, payload?: Partial<Route>) =>
-    setRoute({ name, ...payload });
+  const openJob = (ref: JobRef) => setRoute({ name: 'job-detail', ref });
+  const openRun = (ref?: RunRef) => setRoute({ name: 'runs', ref });
+  const navTo = (name: RouteName) => {
+    if (name === 'job-detail' || name === 'runs') return; // require a ref
+    setRoute({ name } as Route);
+  };
 
   if (!signedIn) {
     return (
@@ -100,7 +117,7 @@ export default function App() {
   return (
     <ToastProvider>
       <div className="h-full w-full flex bg-bg dark:bg-d-bg text-text dark:text-d-text">
-        <Sidebar route={route} navTo={navTo} onOpenPalette={() => setPaletteOpen(true)} />
+        <Sidebar route={route} navTo={navTo} openJob={openJob} onOpenPalette={() => setPaletteOpen(true)} />
         <div className="flex-1 min-w-0 flex flex-col">
           <TopBar
             route={route}
@@ -110,35 +127,34 @@ export default function App() {
           />
           <main className="flex-1 min-h-0">
             {route.name === 'dashboard' && (
-              <Dashboard
-                onOpenJob={(j) => navTo('job-detail', { job: j })}
-                onOpenRun={(j) => navTo('runs', { job: j })}
-              />
+              <Dashboard onOpenJob={openJob} onOpenRun={openRun} />
             )}
             {route.name === 'jobs' && (
-              <JobsIndex
-                onOpenJob={(j) => navTo('job-detail', { job: j })}
-                onOpenRun={(j) => navTo('runs', { job: j })}
-              />
+              <JobsIndex onOpenJob={openJob} onOpenRun={openRun} />
             )}
             {route.name === 'runs' && (
-              <RunDetail job={route.job} onBack={() => navTo('jobs')} />
+              <RunDetail runRef={route.ref} onBack={() => setRoute({ name: 'jobs' })} />
             )}
             {route.name === 'job-detail' && (
               <JobDetail
-                job={route.job}
-                onBack={() => navTo('jobs')}
-                onOpenRun={(j) => navTo('runs', { job: j })}
+                jobRef={route.ref}
+                onBack={() => setRoute({ name: 'jobs' })}
+                onOpenRun={openRun}
               />
             )}
             {route.name === 'sources' && <SourcesScreen />}
-            {route.name === 'recon' && <ReconScreen />}
+            {route.name === 'recon' && <ReconScreen onOpenJob={openJob} />}
             {route.name === 'settings' && <SettingsScreen />}
           </main>
         </div>
       </div>
       {paletteOpen && (
-        <CommandPalette onClose={() => setPaletteOpen(false)} navTo={navTo} />
+        <CommandPalette
+          onClose={() => setPaletteOpen(false)}
+          navTo={navTo}
+          openJob={openJob}
+          openRun={openRun}
+        />
       )}
     </ToastProvider>
   );
@@ -147,12 +163,19 @@ export default function App() {
 function Sidebar({
   route,
   navTo,
+  openJob,
   onOpenPalette,
 }: {
   route: Route;
-  navTo: (name: RouteName, payload?: Partial<Route>) => void;
+  navTo: (name: RouteName) => void;
+  openJob: (ref: JobRef) => void;
   onOpenPalette: () => void;
 }) {
+  // Hit the API for the sidebar's job count and pinned list — the data is
+  // already cached when the operator navigates to the Jobs index.
+  const jobs = useJobs();
+  const pinned = (jobs.data ?? []).filter((j) => j.pinned).slice(0, 4);
+
   return (
     <aside className="w-60 shrink-0 bg-surface dark:bg-d-surface border-r border-border dark:border-d-border flex flex-col">
       <div className="h-14 px-4 flex items-center gap-2 border-b border-border dark:border-d-border">
@@ -195,28 +218,32 @@ function Sidebar({
             >
               <Icon size={14} />
               <span className="flex-1 text-left">{item.label}</span>
-              {item.key === 'jobs' && (
+              {item.key === 'jobs' && jobs.data && (
                 <span className="text-[10px] font-mono tabular text-text-subtle dark:text-d-text-subtle">
-                  {JOBS.length}
+                  {jobs.data.length}
                 </span>
               )}
             </button>
           );
         })}
 
-        <div className="mt-4 px-2 mb-1 text-[10px] uppercase tracking-wide text-text-subtle dark:text-d-text-subtle">
-          Pinned jobs
-        </div>
-        {JOBS.slice(0, 4).map((j) => (
-          <button
-            key={j.id}
-            onClick={() => navTo('job-detail', { job: j })}
-            className="w-full h-7 px-2 rounded-sm flex items-center gap-2 text-xs hover:bg-surface-2 dark:hover:bg-d-surface-2 text-text-muted dark:text-d-text-muted hover:text-text dark:hover:text-d-text"
-          >
-            <StatusDot status={j.status} />
-            <span className="font-mono truncate">{j.code}</span>
-          </button>
-        ))}
+        {pinned.length > 0 && (
+          <>
+            <div className="mt-4 px-2 mb-1 text-[10px] uppercase tracking-wide text-text-subtle dark:text-d-text-subtle">
+              Pinned jobs
+            </div>
+            {pinned.map((j) => (
+              <button
+                key={j.id}
+                onClick={() => openJob({ jobId: j.id, jobCode: j.code })}
+                className="w-full h-7 px-2 rounded-sm flex items-center gap-2 text-xs hover:bg-surface-2 dark:hover:bg-d-surface-2 text-text-muted dark:text-d-text-muted hover:text-text dark:hover:text-d-text"
+              >
+                <StatusDot status={j.last_run_status ?? 'queued'} />
+                <span className="font-mono truncate">{j.code}</span>
+              </button>
+            ))}
+          </>
+        )}
       </nav>
 
       <div className="border-t border-border dark:border-d-border p-3">
@@ -250,6 +277,7 @@ function TopBar({
   setTheme: (t: Theme) => void;
   onOpenPalette: () => void;
 }) {
+  const health = useHealth();
   const crumb: string[][] =
     {
       dashboard: [['Overview']],
@@ -260,6 +288,25 @@ function TopBar({
       recon: [['Reconciliation']],
       settings: [['Settings']],
     }[route.name] ?? [['']];
+
+  let healthLabel: string;
+  let healthTone: 'success' | 'warning' | 'danger';
+  if (health.isPending) {
+    healthLabel = 'lakebridge-api · connecting';
+    healthTone = 'warning';
+  } else if (health.isError) {
+    healthLabel = 'lakebridge-api · unreachable';
+    healthTone = 'danger';
+  } else {
+    healthLabel = `lakebridge-api · healthy · v${health.data?.version ?? '?'}`;
+    healthTone = 'success';
+  }
+  const dotColor = {
+    success: 'bg-success',
+    warning: 'bg-warning',
+    danger: 'bg-danger',
+  }[healthTone];
+
   return (
     <div className="h-14 px-6 border-b border-border dark:border-d-border bg-bg dark:bg-d-bg flex items-center justify-between">
       <div className="flex items-center gap-2 text-sm">
@@ -281,9 +328,12 @@ function TopBar({
         ))}
       </div>
       <div className="flex items-center gap-2">
-        <span className="hidden md:inline-flex items-center gap-1.5 text-xs text-text-muted dark:text-d-text-muted">
-          <span className="inline-block w-1.5 h-1.5 rounded-full bg-success lb-pulse" />
-          lakebridge-api · healthy
+        <span
+          className="hidden md:inline-flex items-center gap-1.5 text-xs text-text-muted dark:text-d-text-muted"
+          title={health.error?.message ?? undefined}
+        >
+          <span className={cx('inline-block w-1.5 h-1.5 rounded-full lb-pulse', dotColor)} />
+          {healthLabel}
         </span>
         <div className="w-px h-5 bg-border dark:bg-d-border" />
         <Button
@@ -338,14 +388,20 @@ type PaletteItem = {
 function CommandPalette({
   onClose,
   navTo,
+  openJob,
+  openRun,
 }: {
   onClose: () => void;
-  navTo: (name: RouteName, payload?: Partial<Route>) => void;
+  navTo: (name: RouteName) => void;
+  openJob: (ref: JobRef) => void;
+  openRun: (ref?: RunRef) => void;
 }) {
   const [q, setQ] = useState('');
   const [idx, setIdx] = useState(0);
   const ref = useRef<HTMLDivElement>(null);
   useClickAway(ref, onClose);
+  const jobs = useJobs();
+  const sources = useSources();
 
   const items = useMemo<PaletteItem[]>(() => {
     const NavIcon = (Icon: ComponentType<LucideProps>) => <Icon size={14} />;
@@ -357,14 +413,14 @@ function CommandPalette({
         icon: NavIcon(n.icon),
         action: () => navTo(n.key),
       })),
-      ...JOBS.slice(0, 14).map((j) => ({
+      ...(jobs.data ?? []).slice(0, 14).map((j) => ({
         kind: 'job' as const,
         label: j.code,
         hint: `Job · ${j.target_table}`,
-        icon: <StatusDot status={j.status} />,
-        action: () => navTo('job-detail', { job: j }),
+        icon: <StatusDot status={j.last_run_status ?? 'queued'} />,
+        action: () => openJob({ jobId: j.id, jobCode: j.code }),
       })),
-      ...SOURCES.map((s) => ({
+      ...(sources.data ?? []).map((s) => ({
         kind: 'source' as const,
         label: s.id,
         hint: `Source · ${s.host}:${s.port}`,
@@ -373,11 +429,11 @@ function CommandPalette({
       })),
       {
         kind: 'action',
-        label: 'Run latest job again',
-        hint: 'Action · Re-runs the most recently scheduled job',
+        label: 'Open latest run',
+        hint: 'Action · Last triggered run',
         icon: <I.refresh size={14} />,
         kbd: '⌘R',
-        action: () => navTo('runs'),
+        action: () => openRun(),
       },
       {
         kind: 'action',
@@ -390,7 +446,7 @@ function CommandPalette({
         label: 'View raw log',
         hint: "Action · Open the current run's raw log",
         icon: <I.terminal size={14} />,
-        action: () => navTo('runs'),
+        action: () => openRun(),
       },
     ];
     if (!q.trim()) return all;
@@ -398,7 +454,7 @@ function CommandPalette({
     return all.filter(
       (x) => x.label.toLowerCase().includes(Q) || x.hint.toLowerCase().includes(Q),
     );
-  }, [q, navTo]);
+  }, [q, navTo, openJob, openRun, jobs.data, sources.data]);
 
   useEffect(() => {
     setIdx(0);

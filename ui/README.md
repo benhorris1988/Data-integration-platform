@@ -10,47 +10,76 @@ which itself was produced from the brief in
 - React 18 + TypeScript + Vite
 - Tailwind CSS (palette + type scale wired into `tailwind.config.js`)
 - `lucide-react` for icons
-- `recharts` is installed but not yet used — the dashboard sparklines and 24h
-  timeline are bespoke SVG to keep the design system tight. Wire `recharts`
-  in if/when the timeline grows beyond what the inline SVG can show.
+- `@tanstack/react-query` for fetching, caching, polling and request dedup
+- `recharts` is installed but not yet used — the sparklines and 24h timeline
+  are bespoke SVG. Wire `recharts` in if/when those grow beyond what inline
+  SVG can show.
 
 ## Scripts
 
 ```bash
-npm install        # install deps
-npm run dev        # vite dev server on :5173
-npm run build      # type-check then bundle
-npm run preview    # serve the production build locally
+npm install            # install deps
+npm run dev            # vite dev server on :5173
+npm run build          # type-check then bundle
+npm run preview        # serve the production build locally
 ```
+
+## Running against a real backend
+
+The dev server proxies `/api/*` to the orchestrator at
+`http://localhost:8080`. Bring it up first:
+
+```bash
+cd ../services/orchestrator
+docker compose up --build           # SQL Server 2022 + orchestrator + migrations
+```
+
+then `npm run dev` here. The UI binds to the API for every screen — Jobs,
+Run detail (with live SSE for the in-flight timer), Dashboard, Sources,
+Reconciliation, Settings/Users, Audit.
+
+Override the proxy target with `LAKEBRIDGE_API_URL` in `.env` (or set
+`VITE_API_BASE_URL` to an absolute URL if you want the bundle to skip the
+proxy and hit the API directly).
 
 ## Layout
 
 ```
 src/
-  App.tsx                  shell · sidebar · top bar · routing · command palette
-  main.tsx                 mounts <App />
-  index.css                Tailwind + scrollbars + keyframes
+  App.tsx                    shell · sidebar · top bar · command palette · routing
+  main.tsx                   QueryClientProvider + mount
+  index.css                  Tailwind + scrollbars + keyframes
   lib/
-    cx.ts                  class-name joiner
-    icons.tsx              lucide-react re-exports under the `I.foo` key map
-  data/sample.ts           typed in-memory fixtures (jobs, runs, errors, …)
+    cx.ts                    class-name joiner
+    icons.tsx                lucide-react re-exports under the `I.foo` key map
+  api/
+    client.ts                fetch wrapper + EventSource subscribe()
+    queries.ts               TanStack Query hooks per endpoint
+    types.ts                 wire shapes mirroring lakebridge/models.py
+    format.ts                relative time, int grouping, durations
   components/primitives.tsx  Button · StatusBadge · Tag · Input · Select · Tabs
-                            · EmptyState · Skeleton · InlineBanner · ThSort
-                            · ToastProvider/useToast · Kbd · DropdownMenu
-                            · Sparkline · Hint · LakebridgeMark
+                             · EmptyState · Skeleton · InlineBanner · ThSort
+                             · ToastProvider/useToast · Kbd · DropdownMenu
+                             · Sparkline · Hint · LakebridgeMark
   screens/
-    Jobs.tsx               /jobs — hero screen, all five state modes
-    Run.tsx                /runs/:id — live timer, step timeline, four tabs
-    Dashboard.tsx          / — KPIs, 24h timeline, errors, currently running
-    Misc.tsx               Job detail · Sources · Recon · Settings · Sign-in
+    Jobs.tsx                 hero screen — jobs table with filters, run-now,
+                              enable/disable, loading + error + empty states
+    Run.tsx                  live run detail — step timeline, errors with
+                              JSON detail, SSE-driven updates while in flight
+    Dashboard.tsx            KPIs · 24h timeline · strategy mix · errors
+    Misc.tsx                 Job detail · Sources · Recon · Settings · Sign-in
 ```
 
-## What is and isn't here
+## What's deliberately not wired yet
 
-- Module-scoped fake data only. There is no real backend.
-- TanStack Query and TanStack Table are not installed yet — once an API
-  exists, the data-table primitive (`<table>` with sticky head + fixed
-  column widths) is shaped to drop into TanStack Table without a rewrite.
-- The Jobs page exposes a "state mode" picker (live/loading/empty/error/
-  partial) for the design states demanded by the brief. Remove the picker
-  when wiring to a real data source.
+- **Auth.** Sign-in is a button that flips a local flag. Wire OIDC (Okta)
+  before exposing this outside corp net.
+- **Schema introspection.** The Job detail Schema tab links to a planned
+  `/api/jobs/:id/schema` endpoint (Oracle USER_TAB_COLUMNS + SQL Server
+  INFORMATION_SCHEMA diff).
+- **Source object discovery.** Sources screen has a "discovery pending"
+  notice; needs a `/api/sources/:id/objects` endpoint.
+- **Raw log streaming.** Run detail Log tab is a placeholder; the
+  orchestrator's structlog output isn't tailable via HTTP yet.
+- **Watermark history.** The current watermark is shown on Job detail;
+  a per-run advance history needs `/api/jobs/:id/watermark-history`.
