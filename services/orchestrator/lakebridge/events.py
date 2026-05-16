@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import threading
+from collections import defaultdict, deque
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -53,3 +55,38 @@ _bus = EventBus()
 
 def bus() -> EventBus:
     return _bus
+
+
+class LogBuffer:
+    """Bounded per-run ring buffer of log payloads.
+
+    When the UI subscribes to /api/runs/:id/log we replay this snapshot
+    before streaming live events — otherwise the operator would only see
+    log lines emitted after they clicked the tab, which is useless for a
+    finished or fast-moving run.
+    """
+
+    def __init__(self, *, per_run_max: int = 500) -> None:
+        self._buffers: dict[int, deque[dict[str, Any]]] = defaultdict(
+            lambda: deque(maxlen=per_run_max)
+        )
+        self._lock = threading.Lock()
+
+    def append(self, run_id: int, payload: dict[str, Any]) -> None:
+        with self._lock:
+            self._buffers[run_id].append(payload)
+
+    def snapshot(self, run_id: int) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self._buffers.get(run_id, ()))
+
+    def discard(self, run_id: int) -> None:
+        with self._lock:
+            self._buffers.pop(run_id, None)
+
+
+_log_buffer = LogBuffer()
+
+
+def log_buffer() -> LogBuffer:
+    return _log_buffer

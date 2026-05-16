@@ -81,6 +81,7 @@ export function subscribe(
     'step.started',
     'step.progress',
     'step.finished',
+    'log.line',
     'ping',
   ];
   for (const t of events) es.addEventListener(t, handler);

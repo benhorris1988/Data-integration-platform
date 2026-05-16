@@ -1,4 +1,4 @@
-import { Fragment, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { Fragment, useEffect, useRef, useState, type ReactNode } from 'react';
 import { useQueryClient } from '@tanstack/react-query';
 import { cx } from '../lib/cx';
 import { I } from '../lib/icons';
@@ -28,6 +28,7 @@ import {
   formatRelative,
 } from '../api/format';
 import type {
+  ApiLogLine,
   ApiMe,
   ApiRun,
   ApiRunError,
@@ -282,7 +283,7 @@ function RunDetailContent({
             <RunErrorsTable errors={errors.data ?? []} isLoading={errors.isPending} />
           )}
           {tab === 'recon' && <RunRecon run={r} />}
-          {tab === 'log' && <RunRawLog />}
+          {tab === 'log' && <RunRawLog runId={r.id} />}
         </div>
       </div>
     </div>
@@ -751,26 +752,138 @@ function ReconCol({
   );
 }
 
-function RunRawLog() {
-  // The orchestrator doesn't expose a log stream yet — structlog writes to
-  // stdout but isn't tailable via HTTP. Coming next: GET /api/runs/:id/log
-  // (Server-Sent Events of stdout lines, filtered to the run's correlation id).
+function RunRawLog({ runId }: { runId: number }) {
+  // SSE subscription with backlog replay. The server emits the per-run
+  // ring buffer first, then tails new lines. We auto-scroll to the bottom
+  // unless the operator has manually scrolled up — same UX as a tail -F.
+  const [lines, setLines] = useState<ApiLogLine[]>([]);
+  const [paused, setPaused] = useState(false);
+  const [connected, setConnected] = useState(false);
+  const scrollRef = useRef<HTMLDivElement>(null);
+  const stickyBottomRef = useRef(true);
+
+  useEffect(() => {
+    setLines([]);
+    setConnected(false);
+    const unsub = subscribe(
+      `/api/runs/${runId}/log`,
+      (type, data) => {
+        if (type === 'ping') return;
+        if (type !== 'log.line') return;
+        setConnected(true);
+        if (paused) return;
+        setLines((prev) => {
+          const next = [...prev, data as ApiLogLine];
+          // Keep the in-memory list bounded; backlog replay is up to 500.
+          if (next.length > 1000) next.splice(0, next.length - 1000);
+          return next;
+        });
+      },
+      () => setConnected(false),
+    );
+    return unsub;
+  }, [runId, paused]);
+
+  // Auto-scroll only if the user is near the bottom; otherwise let them
+  // read history undisturbed.
+  useEffect(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    if (stickyBottomRef.current) el.scrollTop = el.scrollHeight;
+  }, [lines]);
+
+  const onScroll = () => {
+    const el = scrollRef.current;
+    if (!el) return;
+    stickyBottomRef.current = el.scrollHeight - el.scrollTop - el.clientHeight < 40;
+  };
+
   return (
-    <div className="border border-border dark:border-d-border rounded-md bg-surface dark:bg-d-surface">
+    <div className="border border-border dark:border-d-border rounded-md bg-surface dark:bg-d-surface overflow-hidden flex flex-col h-full">
       <div className="px-3 py-2 border-b border-border dark:border-d-border flex items-center justify-between">
         <div className="text-sm">
           <span className="font-medium text-text dark:text-d-text">Raw log</span>
           <span className="text-text-muted dark:text-d-text-muted">
-            {' '}· not yet streamed
+            {' '}· {lines.length} lines · {connected ? 'streaming' : 'connecting…'}
           </span>
         </div>
+        <div className="flex items-center gap-1">
+          <Button
+            variant="ghost"
+            size="sm"
+            iconLeft={<I.download size={12} />}
+            onClick={() => {
+              const blob = new Blob(
+                [lines.map((l) => JSON.stringify(l)).join('\n')],
+                { type: 'application/jsonlines' },
+              );
+              const url = URL.createObjectURL(blob);
+              const a = document.createElement('a');
+              a.href = url;
+              a.download = `run_${runId}.jsonl`;
+              a.click();
+              URL.revokeObjectURL(url);
+            }}
+          >
+            Download
+          </Button>
+          <Button
+            variant="ghost"
+            size="sm"
+            iconLeft={paused ? <I.play size={12} /> : <I.pause size={12} />}
+            onClick={() => setPaused((p) => !p)}
+          >
+            {paused ? 'Resume' : 'Pause'} tail
+          </Button>
+        </div>
       </div>
-      <div className="p-6">
-        <EmptyState
-          icon={<I.terminal size={20} />}
-          title="Log streaming pending."
-          description="GET /api/runs/:id/log isn’t implemented yet. For now, exec into the orchestrator pod and tail stdout filtered by run_id."
-        />
+      <div
+        ref={scrollRef}
+        onScroll={onScroll}
+        className="flex-1 overflow-auto bg-surface dark:bg-d-surface"
+      >
+        {lines.length === 0 ? (
+          <div className="p-6 text-center text-sm text-text-muted dark:text-d-text-muted">
+            Waiting for log lines…
+          </div>
+        ) : (
+          <pre className="px-3 py-2 font-mono text-xs leading-relaxed text-text dark:text-d-text">
+            {lines.map((l, i) => (
+              <div key={i} className="flex gap-3">
+                <span className="text-text-subtle dark:text-d-text-subtle shrink-0 tabular">
+                  {l.ts?.slice(11, 23) ?? ''}
+                </span>
+                <span
+                  className={cx(
+                    'shrink-0 w-12 uppercase',
+                    l.level === 'error'
+                      ? 'text-danger'
+                      : l.level === 'warn' || l.level === 'warning'
+                      ? 'text-warning'
+                      : 'text-text-subtle dark:text-d-text-subtle',
+                  )}
+                >
+                  {l.level}
+                </span>
+                <span className="shrink-0 text-text-muted dark:text-d-text-muted">
+                  {l.logger}
+                </span>
+                <span className="min-w-0">
+                  {l.event}
+                  {Object.keys(l.extra).length > 0 && (
+                    <span className="text-text-subtle dark:text-d-text-subtle">
+                      {' '}
+                      ·{' '}
+                      {Object.entries(l.extra)
+                        .map(([k, v]) => `${k}=${v}`)
+                        .join(' ')}
+                    </span>
+                  )}
+                </span>
+              </div>
+            ))}
+          </pre>
+        )}
       </div>
     </div>
   );

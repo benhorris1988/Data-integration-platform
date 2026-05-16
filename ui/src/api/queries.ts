@@ -10,6 +10,7 @@ import type {
   ApiDashboardKpis,
   ApiJob,
   ApiJobListItem,
+  ApiJobSchema,
   ApiMe,
   ApiRecentError,
   ApiReconRow,
@@ -17,6 +18,7 @@ import type {
   ApiRunError,
   ApiRunStep,
   ApiSource,
+  ApiSourceObject,
   ApiTestConnectionResult,
   ApiTimelineEntry,
   ApiUser,
@@ -44,6 +46,16 @@ export function useJobs(filters: JobsFilters = {}) {
     queryFn: () =>
       request<ApiJobListItem[]>(`/api/jobs${qs ? `?${qs}` : ''}`),
     staleTime: 10_000,
+  });
+}
+
+export function useJobSchema(jobId: number | undefined) {
+  return useQuery({
+    queryKey: ['job-schema', jobId],
+    queryFn: () => request<ApiJobSchema>(`/api/jobs/${jobId}/schema`),
+    enabled: jobId !== undefined,
+    staleTime: 60_000,
+    retry: 0,  // introspection failures usually mean Oracle is down — surface fast
   });
 }
 
@@ -151,6 +163,26 @@ export function useSources() {
     queryKey: ['sources'],
     queryFn: () => request<ApiSource[]>('/api/sources'),
     staleTime: 30_000,
+  });
+}
+
+export function useSourceObjects(
+  sourceId: string | undefined,
+  like: string | undefined,
+  limit = 100,
+) {
+  const params = new URLSearchParams();
+  if (like) params.set('like', like);
+  params.set('limit', String(limit));
+  return useQuery({
+    queryKey: ['source-objects', sourceId, like, limit],
+    queryFn: () =>
+      request<ApiSourceObject[]>(
+        `/api/sources/${sourceId}/objects?${params.toString()}`,
+      ),
+    enabled: sourceId !== undefined,
+    staleTime: 60_000,
+    retry: 0,
   });
 }
 

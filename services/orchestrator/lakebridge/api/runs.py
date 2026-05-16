@@ -15,7 +15,7 @@ from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sse_starlette.sse import EventSourceResponse
 
 from .. import auth, db
-from ..events import bus
+from ..events import bus, log_buffer
 from ..models import Run, RunError, RunStep
 
 router = APIRouter(prefix="/api/runs", tags=["runs"])
@@ -123,6 +123,39 @@ async def events(
                 except TimeoutError:
                     # Keep the connection alive through corporate proxies.
                     yield {"event": "ping", "data": "{}"}
+                    continue
+                if ev.payload.get("run_id") != run_id:
+                    continue
+                yield {"event": ev.type, "data": json.dumps(ev.payload)}
+
+    return EventSourceResponse(stream())
+
+
+@router.get("/{run_id}/log")
+async def log_stream(
+    run_id: int,
+    request: Request,
+    _: Annotated[auth.User, Depends(auth.current_user)],
+) -> EventSourceResponse:
+    """SSE stream of log lines for a run. Replays the per-run ring buffer
+    (last ~500 lines) on subscribe, then tails new lines. Useful for live
+    debugging during an in-flight run; finished runs only show backlog."""
+
+    async def stream():
+        # Replay first so the operator sees context before live lines arrive.
+        for line in log_buffer().snapshot(run_id):
+            yield {"event": "log.line", "data": json.dumps(line)}
+
+        async with bus().subscribe() as q:
+            while True:
+                if await request.is_disconnected():
+                    break
+                try:
+                    ev = await asyncio.wait_for(q.get(), timeout=15.0)
+                except TimeoutError:
+                    yield {"event": "ping", "data": "{}"}
+                    continue
+                if ev.type != "log.line":
                     continue
                 if ev.payload.get("run_id") != run_id:
                     continue

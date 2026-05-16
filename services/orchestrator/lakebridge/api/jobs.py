@@ -13,6 +13,7 @@ from pydantic import BaseModel
 
 from .. import auth, db
 from ..models import Job, JobListItem, Run
+from ..secrets import get_resolver
 from .runs import enqueue_run
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
@@ -91,6 +92,216 @@ def list_job_runs(
         (job_id,),
     )
     return [Run.model_validate(r) for r in rows]
+
+
+class SchemaColumn(BaseModel):
+    name: str
+    data_type: str
+    nullable: bool
+
+
+class SchemaMapping(BaseModel):
+    src: SchemaColumn | None
+    tgt: SchemaColumn | None
+    drift: str | None  # 'cast' | 'new' | 'missing' | None
+
+
+class SchemaResponse(BaseModel):
+    source_object: str
+    target: str
+    source_columns: list[SchemaColumn]
+    target_columns: list[SchemaColumn]
+    mapping: list[SchemaMapping]
+
+
+@router.get("/{job_id}/schema", response_model=SchemaResponse)
+def get_job_schema(
+    job_id: int,
+    _: Annotated[auth.User, Depends(auth.current_user)],
+) -> SchemaResponse:
+    """Compare the source object's columns (Oracle ALL_TAB_COLUMNS) with
+    the target table's columns (SQL Server INFORMATION_SCHEMA.COLUMNS) and
+    return a side-by-side mapping with drift flags.
+
+    drift values:
+      `cast`    — names align but the target type is narrower than the source
+      `new`     — source column has no target column
+      `missing` — target has a column the source doesn't (Lakebridge trailer
+                  columns are filtered out before this comparison)
+    """
+    job = db.fetch_one(
+        "SELECT j.source_object, j.target_schema, j.target_table, "
+        "       s.host, s.port, s.sid, s.service_name, s.username, s.secret_ref, "
+        "       s.tls_required "
+        "FROM lakebridge.jobs j "
+        "JOIN lakebridge.sources s ON s.id = j.source_id "
+        "WHERE j.id = ?",
+        (job_id,),
+    )
+    if job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+    source_columns = _read_source_columns(job)
+    target_columns = _read_target_columns(job)
+    return SchemaResponse(
+        source_object=str(job["source_object"]),
+        target=f"{job['target_schema']}.{job['target_table']}",
+        source_columns=source_columns,
+        target_columns=target_columns,
+        mapping=_diff_columns(source_columns, target_columns),
+    )
+
+
+def _read_source_columns(job: dict[str, Any]) -> list[SchemaColumn]:
+    import oracledb
+
+    from ..runner.sources.oracle import OracleEndpoint
+
+    password = get_resolver().resolve(job["secret_ref"])
+    if not password:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"secret {job['secret_ref']!r} not resolvable",
+        )
+    owner, name = _split_owner(str(job["source_object"]))
+    ep = OracleEndpoint(
+        host=job["host"], port=job["port"], sid=job["sid"],
+        service_name=job["service_name"], user=job["username"],
+        password=password, tls_required=bool(job["tls_required"]),
+    )
+    dsn = (
+        oracledb.makedsn(ep.host, ep.port, service_name=ep.service_name)
+        if ep.service_name
+        else oracledb.makedsn(ep.host, ep.port, sid=ep.sid)
+    )
+    try:
+        conn = oracledb.connect(user=ep.user, password=ep.password, dsn=dsn)
+    except oracledb.DatabaseError as exc:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, f"oracle: {str(exc).splitlines()[0][:200]}"
+        ) from exc
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT column_name, data_type, data_length, data_precision, data_scale, nullable "
+                "FROM all_tab_columns WHERE owner = :owner AND table_name = :name "
+                "ORDER BY column_id",
+                {"owner": owner, "name": name},
+            )
+            cols: list[SchemaColumn] = []
+            for row in cur.fetchall():
+                col_name, dtype, length, precision, scale, nullable = row
+                cols.append(
+                    SchemaColumn(
+                        name=str(col_name),
+                        data_type=_format_oracle_type(dtype, length, precision, scale),
+                        nullable=(nullable == "Y"),
+                    )
+                )
+            return cols
+    finally:
+        conn.close()
+
+
+def _read_target_columns(job: dict[str, Any]) -> list[SchemaColumn]:
+    rows = db.fetch_all(
+        "SELECT column_name, data_type, character_maximum_length, "
+        "       numeric_precision, numeric_scale, is_nullable "
+        "FROM INFORMATION_SCHEMA.COLUMNS "
+        "WHERE table_schema = ? AND table_name = ? "
+        "  AND column_name NOT LIKE 'lb\\_%' ESCAPE '\\' "
+        "ORDER BY ordinal_position",
+        (job["target_schema"], job["target_table"]),
+    )
+    return [
+        SchemaColumn(
+            name=str(r["column_name"]),
+            data_type=_format_sqlserver_type(
+                r["data_type"],
+                r["character_maximum_length"],
+                r["numeric_precision"],
+                r["numeric_scale"],
+            ),
+            nullable=(r["is_nullable"] == "YES"),
+        )
+        for r in rows
+    ]
+
+
+def _diff_columns(
+    src: list[SchemaColumn], tgt: list[SchemaColumn]
+) -> list[SchemaMapping]:
+    """Match by case-insensitive name. Cast drift is detected only for the
+    classic NUMBER(22,6) → DECIMAL(18,4) case; anything else returns
+    drift=None unless one side is missing the column entirely."""
+    by_src = {c.name.lower(): c for c in src}
+    by_tgt = {c.name.lower(): c for c in tgt}
+    out: list[SchemaMapping] = []
+    for s in src:
+        t = by_tgt.get(s.name.lower())
+        if t is None:
+            out.append(SchemaMapping(src=s, tgt=None, drift="new"))
+        else:
+            out.append(
+                SchemaMapping(
+                    src=s,
+                    tgt=t,
+                    drift="cast" if _looks_like_cast(s.data_type, t.data_type) else None,
+                )
+            )
+    # Target columns the source doesn't have (rare; usually means the
+    # staging table accreted a column that should be added back into the
+    # source projection).
+    for t in tgt:
+        if t.name.lower() not in by_src:
+            out.append(SchemaMapping(src=None, tgt=t, drift="missing"))
+    return out
+
+
+def _split_owner(qualified: str) -> tuple[str, str]:
+    if "." not in qualified:
+        return ("", qualified.upper())
+    owner, name = qualified.split(".", 1)
+    return owner.upper(), name.upper()
+
+
+def _format_oracle_type(
+    dtype: str, length: int | None, precision: int | None, scale: int | None
+) -> str:
+    dtype = (dtype or "").upper()
+    if dtype.startswith(("VARCHAR2", "NVARCHAR2", "CHAR")) and length:
+        return f"{dtype}({length})"
+    if dtype == "NUMBER":
+        if precision and scale:
+            return f"NUMBER({precision},{scale})"
+        if precision:
+            return f"NUMBER({precision})"
+        return "NUMBER"
+    return dtype
+
+
+def _format_sqlserver_type(
+    dtype: str, length: int | None, precision: int | None, scale: int | None
+) -> str:
+    dtype = (dtype or "").lower()
+    if dtype in {"nvarchar", "varchar", "nchar", "char"} and length:
+        return f"{dtype}({length if length > 0 else 'max'})"
+    if dtype == "decimal" and precision is not None:
+        return f"decimal({precision},{scale or 0})"
+    if dtype in {"datetime2", "datetimeoffset", "time"} and scale is not None:
+        return f"{dtype}({scale})"
+    return dtype
+
+
+def _looks_like_cast(src_type: str, tgt_type: str) -> bool:
+    """Detect classic narrowings: NUMBER(p,s) → decimal(p',s') with smaller p or s."""
+    if src_type.upper().startswith("NUMBER(") and tgt_type.lower().startswith("decimal("):
+        try:
+            sp, ss = src_type[7:-1].split(",")
+            tp, ts = tgt_type[8:-1].split(",")
+            return int(tp) < int(sp) or int(ts) < int(ss)
+        except (ValueError, IndexError):
+            return False
+    return False
 
 
 @router.post("/{job_id}/run", status_code=status.HTTP_202_ACCEPTED)

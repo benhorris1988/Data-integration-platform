@@ -158,6 +158,12 @@ def execute_run(
     returns normally (it does not re-raise). Callers should not assume
     success from a non-exception return; check `result.status`.
     """
+    # Bind run_id to structlog's contextvars so every log line emitted
+    # while this run executes carries it. The log tap publishes them onto
+    # the bus / ring buffer for /api/runs/:id/log to stream.
+    import structlog
+
+    structlog.contextvars.bind_contextvars(run_id=run_id, job_code=spec.code)
     log.info("run.start", run_id=run_id, job_code=spec.code)
     state.on_run_start(run_id)
 
@@ -316,6 +322,7 @@ def execute_run(
         status = "succeeded"
     state.on_run_finish(run_id, status, watermark_after)
     log.info("run.finish", run_id=run_id, status=status, rows=rows_loaded)
+    structlog.contextvars.unbind_contextvars("run_id", "job_code")
     return RunResult(
         run_id=run_id,
         status=status,

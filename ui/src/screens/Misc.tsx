@@ -18,8 +18,10 @@ import {
   useDevSignIn,
   useJob,
   useJobRuns,
+  useJobSchema,
   useReconMatrix,
   useRunJob,
+  useSourceObjects,
   useSources,
   useTestConnection,
   useToggleJob,
@@ -165,7 +167,7 @@ export function JobDetail({
         />
         <div className="flex-1 min-h-0 overflow-auto py-4">
           {tab === 'config' && <JobConfig job={j} isLoading={job.isPending} />}
-          {tab === 'schema' && <JobSchema />}
+          {tab === 'schema' && j && <JobSchema jobId={j.id} />}
           {tab === 'history' && j && (
             <JobHistory jobId={j.id} jobCode={j.code} onOpenRun={onOpenRun} />
           )}
@@ -283,17 +285,126 @@ function JobConfig({ job, isLoading }: { job: ApiJob | undefined; isLoading: boo
   );
 }
 
-function JobSchema() {
-  // Schema introspection (Oracle USER_TAB_COLUMNS + SQL Server INFORMATION_SCHEMA)
-  // isn't exposed by the API yet. The orchestrator will need a per-job
-  // /api/jobs/:id/schema endpoint when we wire it.
-  return (
-    <div className="border border-border dark:border-d-border rounded-md bg-surface dark:bg-d-surface p-6">
-      <EmptyState
-        icon={<I.database size={20} />}
-        title="Schema introspection not wired yet."
-        description="The runner casts column-by-column but the per-job schema diff API hasn't been built. Coming next: GET /api/jobs/:id/schema."
+function JobSchema({ jobId }: { jobId: number }) {
+  const schema = useJobSchema(jobId);
+
+  if (schema.isPending) {
+    return (
+      <div className="space-y-2">
+        {Array.from({ length: 8 }).map((_, i) => (
+          <SkeletonBlock key={i} h={28} />
+        ))}
+      </div>
+    );
+  }
+  if (schema.isError) {
+    return (
+      <InlineBanner
+        tone="danger"
+        title="Schema introspection failed."
+        description={
+          schema.error instanceof Error
+            ? schema.error.message
+            : 'Could not reach the source or target.'
+        }
+        action={
+          <Button variant="secondary" size="sm" onClick={() => schema.refetch()}>
+            Retry
+          </Button>
+        }
       />
+    );
+  }
+
+  const s = schema.data!;
+  const driftCount = s.mapping.filter((m) => m.drift !== null).length;
+  return (
+    <div className="border border-border dark:border-d-border rounded-md bg-surface dark:bg-d-surface overflow-hidden">
+      <div className="px-4 py-2.5 border-b border-border dark:border-d-border flex items-center justify-between">
+        <div className="flex items-center gap-2">
+          <h3 className="text-base font-medium text-text dark:text-d-text">Schema mapping</h3>
+          <Tag>{s.mapping.length} columns</Tag>
+          {driftCount > 0 && (
+            <Tag className="border-warning/40 text-warning">{driftCount} drift</Tag>
+          )}
+        </div>
+        <Button
+          variant="ghost"
+          size="sm"
+          iconLeft={<I.refresh size={12} />}
+          loading={schema.isFetching}
+          onClick={() => schema.refetch()}
+        >
+          Re-detect
+        </Button>
+      </div>
+      <table className="w-full text-sm">
+        <thead>
+          <tr className="text-xs uppercase tracking-wide text-text-muted dark:text-d-text-muted">
+            <th className="text-left py-2 px-4 font-medium">Source column</th>
+            <th className="text-left py-2 px-3 font-medium">Source type</th>
+            <th className="text-left py-2 px-3 font-medium w-6"></th>
+            <th className="text-left py-2 px-3 font-medium">Target column</th>
+            <th className="text-left py-2 px-3 font-medium">Target type</th>
+            <th className="text-left py-2 px-4 font-medium">Drift</th>
+          </tr>
+        </thead>
+        <tbody>
+          {s.mapping.map((m, i) => (
+            <tr
+              key={i}
+              className={cx(
+                'border-t border-border dark:border-d-border',
+                m.drift && 'bg-warning/5 dark:bg-warning/10',
+              )}
+            >
+              <td className="py-1.5 px-4 font-mono text-text dark:text-d-text">
+                {m.src?.name ?? '—'}
+              </td>
+              <td className="py-1.5 px-3 font-mono text-text-muted dark:text-d-text-muted">
+                {m.src?.data_type ?? '—'}
+              </td>
+              <td className="py-1.5 px-3 text-text-subtle dark:text-d-text-subtle">
+                <I.arrowRight size={12} />
+              </td>
+              <td
+                className={cx(
+                  'py-1.5 px-3 font-mono',
+                  m.tgt ? 'text-text dark:text-d-text' : 'text-text-subtle dark:text-d-text-subtle',
+                )}
+              >
+                {m.tgt?.name ?? '— (not mapped)'}
+              </td>
+              <td className="py-1.5 px-3 font-mono text-text-muted dark:text-d-text-muted">
+                {m.tgt?.data_type ?? '—'}
+              </td>
+              <td className="py-1.5 px-4">
+                {m.drift === 'cast' && (
+                  <span className="inline-flex items-center gap-1.5 text-xs text-warning">
+                    <I.alertTriangle size={12} />
+                    Implicit cast
+                  </span>
+                )}
+                {m.drift === 'new' && (
+                  <span className="inline-flex items-center gap-1.5 text-xs text-warning">
+                    <I.alertTriangle size={12} />
+                    New, unmapped
+                  </span>
+                )}
+                {m.drift === 'missing' && (
+                  <span className="inline-flex items-center gap-1.5 text-xs text-warning">
+                    <I.alertTriangle size={12} />
+                    Target only
+                  </span>
+                )}
+                {!m.drift && (
+                  <span className="text-xs text-text-subtle dark:text-d-text-subtle">—</span>
+                )}
+              </td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
     </div>
   );
 }
@@ -616,15 +727,90 @@ export function SourcesScreen({ me }: { me: ApiMe }) {
             </div>
           )}
 
-          <div className="border border-border dark:border-d-border rounded-md bg-surface dark:bg-d-surface p-6">
-            <EmptyState
-              icon={<I.database size={20} />}
-              title="Source object discovery pending."
-              description="GET /api/sources/:id/objects (Oracle USER_TABLES introspection) hasn’t been built yet."
-            />
-          </div>
+          {selected && <SourceObjectsList sourceId={selected.id} />}
         </div>
       </div>
+    </div>
+  );
+}
+
+function SourceObjectsList({ sourceId }: { sourceId: string }) {
+  const [filter, setFilter] = useState('IFSAPP.%');
+  const objects = useSourceObjects(sourceId, filter.trim() || undefined, 200);
+
+  return (
+    <div className="border border-border dark:border-d-border rounded-md bg-surface dark:bg-d-surface overflow-hidden">
+      <div className="px-4 py-2.5 border-b border-border dark:border-d-border flex items-center justify-between gap-3">
+        <h3 className="text-base font-medium text-text dark:text-d-text">Source objects</h3>
+        <div className="flex items-center gap-2">
+          <input
+            value={filter}
+            onChange={(e) => setFilter(e.target.value)}
+            placeholder="OWNER.%"
+            className="w-44 h-7 px-2 rounded-sm border border-border-strong dark:border-d-border-strong bg-surface dark:bg-d-surface text-xs font-mono"
+          />
+          <span className="text-xs text-text-subtle dark:text-d-text-subtle tabular">
+            {objects.data?.length ?? '—'} matched
+          </span>
+        </div>
+      </div>
+      {objects.isPending ? (
+        <div className="p-4 space-y-2">
+          {Array.from({ length: 6 }).map((_, i) => (
+            <SkeletonBlock key={i} h={20} />
+          ))}
+        </div>
+      ) : objects.isError ? (
+        <div className="p-3">
+          <InlineBanner
+            tone="danger"
+            title="Could not list source objects."
+            description={
+              objects.error instanceof Error ? objects.error.message : 'Unknown error'
+            }
+            action={
+              <Button variant="secondary" size="sm" onClick={() => objects.refetch()}>
+                Retry
+              </Button>
+            }
+          />
+        </div>
+      ) : objects.data && objects.data.length === 0 ? (
+        <div className="px-4 py-8 text-center text-sm text-text-muted dark:text-d-text-muted">
+          No objects match this pattern.
+        </div>
+      ) : (
+        <table className="w-full text-sm">
+          <thead>
+            <tr className="text-xs uppercase tracking-wide text-text-muted dark:text-d-text-muted">
+              <th className="text-left py-2 px-4 font-medium">Object</th>
+              <th className="text-left py-2 px-3 font-medium">Kind</th>
+              <th className="text-right py-2 px-3 font-medium">Row count</th>
+              <th className="text-right py-2 px-4 font-medium">Last analyzed</th>
+            </tr>
+          </thead>
+          <tbody>
+            {(objects.data ?? []).map((o) => (
+              <tr
+                key={o.name}
+                className="border-t border-border dark:border-d-border hover:bg-surface-2 dark:hover:bg-d-surface-2"
+                style={{ height: 32 }}
+              >
+                <td className="px-4 font-mono text-text dark:text-d-text">{o.name}</td>
+                <td className="px-3">
+                  <Tag>{o.kind.toLowerCase()}</Tag>
+                </td>
+                <td className="px-3 text-right tabular text-text dark:text-d-text">
+                  {o.num_rows == null ? '—' : formatInt(o.num_rows)}
+                </td>
+                <td className="px-4 text-right text-xs text-text-muted dark:text-d-text-muted">
+                  {formatRelative(o.last_analyzed)}
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      )}
     </div>
   );
 }

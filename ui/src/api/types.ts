@@ -223,3 +223,44 @@ export type ApiAuthConfig = {
   okta_login_url: string | null;
   dev_users: string[];
 };
+
+// Schema introspection — Job detail "Schema" tab.
+export type ApiSchemaColumn = {
+  name: string;
+  data_type: string;
+  nullable: boolean;
+};
+
+export type ApiSchemaMapping = {
+  src: ApiSchemaColumn | null;
+  tgt: ApiSchemaColumn | null;
+  drift: 'cast' | 'new' | 'missing' | null;
+};
+
+export type ApiJobSchema = {
+  source_object: string;
+  target: string;
+  source_columns: ApiSchemaColumn[];
+  target_columns: ApiSchemaColumn[];
+  mapping: ApiSchemaMapping[];
+};
+
+// Source object discovery — Sources screen.
+export type ApiSourceObject = {
+  name: string;
+  owner: string;
+  object_name: string;
+  kind: 'TABLE' | 'VIEW';
+  num_rows: number | null;
+  last_analyzed: string | null;
+};
+
+// One log line from /api/runs/:id/log SSE.
+export type ApiLogLine = {
+  run_id: number;
+  level: string;
+  ts: string;
+  logger: string;
+  event: string;
+  extra: Record<string, string | number | boolean | null>;
+};
