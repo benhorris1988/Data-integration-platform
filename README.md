@@ -4,17 +4,29 @@ Internal operator console for moving data from IFS Applications (Oracle-backed E
 
 Small audience (<12 data engineers and migration leads), runs on corporate networks only, never public-facing.
 
-## Status
-
-Pre-implementation. The UI design brief lives in [`docs/design/lakebridge-ui-brief.md`](docs/design/lakebridge-ui-brief.md) and is the source of truth for the operator console look-and-feel. The UI itself will be produced via Claude Design from that brief; the resulting React manifest will land in this repo once delivered.
-
-## Layout (planned)
+## Layout
 
 ```
-docs/                Design briefs, ADRs, runbooks
-ui/                  React operator console (Claude Design output)
-services/            Lakebridge orchestrator, extractors, loaders
-db/                  Migrations and schema for the platform's own metadata
+docs/
+  design/
+    lakebridge-ui-brief.md       canonical UI design brief (the source)
+    manifest/                    Claude Design output — design reference
+      README.md                  handoff doc (tokens, screens, components)
+      prototype/                 HTML + Babel-in-the-browser preview
+ui/                              React + TS + Vite operator console (live)
 ```
 
-Nothing below `ui/` or `services/` exists yet — the repo currently holds the design brief and this README only.
+`services/` and `db/` (orchestrator, extractors, loaders, metadata schema)
+will be added once the backend is scoped — see the brief.
+
+## UI
+
+```bash
+cd ui && npm install && npm run dev
+```
+
+The console implements every screen called out in the brief — Jobs (hero),
+Run detail (live timer), Dashboard, Job detail, Sources, Reconciliation,
+Settings, Sign-in — plus the design system primitives, dark mode, and a
+⌘K command palette. Data is module-scoped fixtures in `ui/src/data/sample.ts`
+and gets swapped for real queries once the orchestrator API exists.
