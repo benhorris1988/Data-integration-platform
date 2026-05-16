@@ -11,22 +11,34 @@ docs/
   design/
     lakebridge-ui-brief.md       canonical UI design brief (the source)
     manifest/                    Claude Design output — design reference
-      README.md                  handoff doc (tokens, screens, components)
-      prototype/                 HTML + Babel-in-the-browser preview
-ui/                              React + TS + Vite operator console (live)
+db/
+  migrations/                    numbered T-SQL applied in order
+  staging/                       conventions + a worked example
+services/
+  orchestrator/                  Python 3.12 + FastAPI service:
+                                   API the UI calls, runner that moves IFS
+                                   data, scheduler that fires cron jobs
+ui/                              React + TS + Vite operator console
 ```
 
-`services/` and `db/` (orchestrator, extractors, loaders, metadata schema)
-will be added once the backend is scoped — see the brief.
-
-## UI
+## Running the whole thing locally
 
 ```bash
-cd ui && npm install && npm run dev
+# 1. SQL Server + orchestrator
+cd services/orchestrator
+cp .env.example .env
+docker compose up --build       # API on :8080, migrations auto-applied
+
+# 2. UI (separate terminal)
+cd ui && npm install && npm run dev   # :5173, talks to the API above
 ```
 
-The console implements every screen called out in the brief — Jobs (hero),
-Run detail (live timer), Dashboard, Job detail, Sources, Reconciliation,
-Settings, Sign-in — plus the design system primitives, dark mode, and a
-⌘K command palette. Data is module-scoped fixtures in `ui/src/data/sample.ts`
-and gets swapped for real queries once the orchestrator API exists.
+## Components
+
+- **UI** — every screen the brief calls out, dark mode, ⌘K command palette.
+  See [`ui/README.md`](ui/README.md).
+- **DB** — single SQL Server instance hosts both `lakebridge.*` metadata
+  and `stg_ifs_*.*` staging tables. See [`db/README.md`](db/README.md).
+- **Orchestrator** — FastAPI API + cron + queue worker + extraction engine
+  (Oracle → SQL Server via python-oracledb + pyodbc). See
+  [`services/orchestrator/README.md`](services/orchestrator/README.md).
