@@ -1,20 +1,27 @@
-"""/api/jobs — list, detail, trigger, enable/disable.
+"""/api/jobs — list, detail, trigger, enable/disable, CRUD.
 
 All endpoints require a signed-in user. State-changing endpoints (run /
-enable / disable) require Operator or Admin.
+enable / disable / create / update / delete) require Operator or Admin.
 """
 
 from __future__ import annotations
 
-from typing import Annotated, Any
+import re
+from typing import Annotated, Any, Literal
 
+from croniter import croniter
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from .. import auth, db
-from ..models import Job, JobListItem, Run
+from ..models import Job, JobListItem, Run, Strategy
 from ..secrets import get_resolver
 from .runs import enqueue_run
+
+# Codes must be dotted, uppercase, no spaces — operator's primary handle.
+# Loose enough to be ergonomic (length 4..120) but tight enough that the
+# audit log stays scannable.
+_JOB_CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]*(?:\.[A-Z][A-Z0-9_]*)+$")
 
 router = APIRouter(prefix="/api/jobs", tags=["jobs"])
 
@@ -366,6 +373,218 @@ def run_now(
         },
     )
     return {"run_id": run_id}
+
+
+# ── CRUD ────────────────────────────────────────────────────────────────
+
+
+class JobBody(BaseModel):
+    """Mutable fields of a job. Used for both POST (create) and PUT
+    (update). Constraints mirror the CHECK constraints on `lakebridge.jobs`
+    so the API surfaces a 400 with a useful message before the database
+    has to reject it."""
+
+    code: str = Field(min_length=4, max_length=120)
+    source_id: str = Field(min_length=1, max_length=40)
+    source_object: str = Field(min_length=1, max_length=240)
+    source_query: str | None = None
+    target_schema: str = Field(min_length=1, max_length=80)
+    target_table: str = Field(min_length=1, max_length=80)
+    strategy: Strategy
+    schedule: str = Field(default="manual", max_length=60)
+    watermark_column: str | None = None
+    watermark_grace_sec: int = Field(default=300, ge=0)
+    batch_size: int = Field(default=5000, ge=1, le=1_000_000)
+    retries: int = Field(default=3, ge=0, le=20)
+    timeout_sec: int = Field(default=2700, ge=1)
+    owner: str = Field(min_length=1, max_length=120)
+    enabled: bool = True
+
+    @field_validator("code")
+    @classmethod
+    def _code_shape(cls, v: str) -> str:
+        if not _JOB_CODE_RE.match(v):
+            raise ValueError(
+                "code must be dotted, uppercase letters/digits/underscores "
+                "(e.g. EXT.MAT.MASTER.FULL)"
+            )
+        return v
+
+    @field_validator("schedule")
+    @classmethod
+    def _schedule_valid(cls, v: str) -> str:
+        if v == "manual":
+            return v
+        try:
+            croniter(v)
+        except (ValueError, KeyError) as exc:
+            raise ValueError(f"invalid cron expression: {exc}") from exc
+        return v
+
+    @field_validator("target_schema")
+    @classmethod
+    def _target_schema_prefix(cls, v: str) -> str:
+        if not v.lower().startswith("stg_"):
+            raise ValueError("target_schema must start with stg_")
+        return v
+
+
+def _validate_business_rules(body: JobBody) -> None:
+    """Cross-field validation that doesn't fit a single field_validator."""
+    if body.strategy == "watermark_delta" and not body.watermark_column:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "watermark_delta strategy requires watermark_column",
+        )
+    # The source must already exist — provisioning sources is a separate
+    # operation (Vault path, TLS, pool size).
+    found = db.fetch_one(
+        "SELECT 1 AS x FROM lakebridge.sources WHERE id = ?", (body.source_id,)
+    )
+    if found is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"source_id {body.source_id!r} does not exist",
+        )
+
+
+@router.post("", response_model=Job, status_code=status.HTTP_201_CREATED)
+def create_job(
+    body: JobBody,
+    user: Annotated[auth.User, Depends(auth.RequireOperator)],
+) -> Job:
+    """Create a new job. The `code` must be globally unique."""
+    _validate_business_rules(body)
+    # Pre-flight uniqueness check — the DB has a UNIQUE constraint as the
+    # final word, but a friendly 409 beats a generic 500.
+    dup = db.fetch_one("SELECT id FROM lakebridge.jobs WHERE code = ?", (body.code,))
+    if dup is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f"job code {body.code!r} already exists"
+        )
+    with db.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO lakebridge.jobs "
+            "(code, source_id, source_object, source_query, target_schema, target_table, "
+            " strategy, schedule, watermark_column, watermark_grace_sec, batch_size, "
+            " retries, timeout_sec, owner, enabled, created_by, updated_by) "
+            "OUTPUT INSERTED.id "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                body.code, body.source_id, body.source_object, body.source_query,
+                body.target_schema, body.target_table, body.strategy, body.schedule,
+                body.watermark_column, body.watermark_grace_sec, body.batch_size,
+                body.retries, body.timeout_sec, body.owner, body.enabled,
+                user.email, user.email,
+            ),
+        )
+        new_id = int(cur.fetchone()[0])
+        conn.commit()
+    auth.audit(user, "job.create", body.code, {"job_id": new_id})
+    return get_job(new_id, user)  # type: ignore[arg-type]
+
+
+@router.put("/{job_id}", response_model=Job)
+def update_job(
+    job_id: int,
+    body: JobBody,
+    user: Annotated[auth.User, Depends(auth.RequireOperator)],
+) -> Job:
+    """Replace a job's mutable fields. `code` is editable but must remain
+    unique — a rename is a metadata-only change."""
+    _validate_business_rules(body)
+    existing = db.fetch_one(
+        "SELECT id, code FROM lakebridge.jobs WHERE id = ?", (job_id,)
+    )
+    if existing is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+    if body.code != existing["code"]:
+        dup = db.fetch_one(
+            "SELECT id FROM lakebridge.jobs WHERE code = ? AND id <> ?",
+            (body.code, job_id),
+        )
+        if dup is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, f"job code {body.code!r} already in use"
+            )
+    db.execute(
+        "UPDATE lakebridge.jobs SET "
+        "  code = ?, source_id = ?, source_object = ?, source_query = ?, "
+        "  target_schema = ?, target_table = ?, strategy = ?, schedule = ?, "
+        "  watermark_column = ?, watermark_grace_sec = ?, batch_size = ?, "
+        "  retries = ?, timeout_sec = ?, owner = ?, enabled = ?, "
+        "  updated_at = SYSUTCDATETIME(), updated_by = ? "
+        "WHERE id = ?",
+        (
+            body.code, body.source_id, body.source_object, body.source_query,
+            body.target_schema, body.target_table, body.strategy, body.schedule,
+            body.watermark_column, body.watermark_grace_sec, body.batch_size,
+            body.retries, body.timeout_sec, body.owner, body.enabled,
+            user.email, job_id,
+        ),
+    )
+    auth.audit(
+        user, "job.edit", body.code, {"job_id": job_id, "before_code": existing["code"]}
+    )
+    return get_job(job_id, user)  # type: ignore[arg-type]
+
+
+@router.delete(
+    "/{job_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None
+)
+def delete_job(
+    job_id: int,
+    user: Annotated[auth.User, Depends(auth.RequireAdmin)],
+    force: bool = Query(default=False),
+) -> None:
+    """Delete a job. Refuses if any runs exist for it unless `force=true`
+    is supplied (the runs cascade-delete via ON DELETE CASCADE on the
+    foreign key)."""
+    job = db.fetch_one("SELECT code FROM lakebridge.jobs WHERE id = ?", (job_id,))
+    if job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+    run_count_row = db.fetch_one(
+        "SELECT COUNT(*) AS n FROM lakebridge.runs WHERE job_id = ?", (job_id,)
+    )
+    run_count = int((run_count_row or {}).get("n") or 0)
+    if run_count > 0 and not force:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"job has {run_count} run(s); pass ?force=true to delete anyway",
+        )
+    db.execute("DELETE FROM lakebridge.jobs WHERE id = ?", (job_id,))
+    auth.audit(
+        user, "job.delete", str(job["code"]), {"job_id": job_id, "run_count": run_count}
+    )
+
+
+class PinBody(BaseModel):
+    pinned: bool
+
+
+@router.post("/{job_id}/pin", response_model=dict[str, bool])
+def set_pinned(
+    job_id: int,
+    body: PinBody,
+    user: Annotated[auth.User, Depends(auth.RequireOperator)],
+) -> dict[str, bool]:
+    """Pin (or un-pin) a job — pinned jobs show up in the sidebar."""
+    job = db.fetch_one("SELECT code FROM lakebridge.jobs WHERE id = ?", (job_id,))
+    if job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+    db.execute(
+        "UPDATE lakebridge.jobs SET pinned = ?, updated_at = SYSUTCDATETIME(), "
+        "                           updated_by = ? "
+        "WHERE id = ?",
+        (1 if body.pinned else 0, user.email, job_id),
+    )
+    auth.audit(
+        user, "job.pin" if body.pinned else "job.unpin", str(job["code"]), {"job_id": job_id}
+    )
+    return {"pinned": body.pinned}
+
+
+_ = Literal  # keep import alive in case future strategy types are added
 
 
 @router.post("/{job_id}/disable")

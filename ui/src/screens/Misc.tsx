@@ -15,6 +15,7 @@ import {
 import {
   useAudit,
   useAuthConfig,
+  useDeleteJob,
   useDevSignIn,
   useJob,
   useJobRuns,
@@ -27,6 +28,7 @@ import {
   useToggleJob,
   useUsers,
 } from '../api/queries';
+import { JobEditor } from './JobEditor';
 import {
   formatDuration,
   formatInt,
@@ -53,8 +55,11 @@ export function JobDetail({
   const job = useJob(jobRef.jobId);
   const runJob = useRunJob();
   const toggleJob = useToggleJob();
+  const deleteJob = useDeleteJob();
   const [tab, setTab] = useState<'config' | 'schema' | 'history' | 'watermarks'>('config');
   const [backfillOpen, setBackfillOpen] = useState(false);
+  const [editing, setEditing] = useState(false);
+  const isAdmin = me.role === 'Admin';
 
   if (job.isError) {
     return (
@@ -179,7 +184,54 @@ export function JobDetail({
           ]}
         />
         <div className="flex-1 min-h-0 overflow-auto py-4">
-          {tab === 'config' && <JobConfig job={j} isLoading={job.isPending} />}
+          {tab === 'config' && (
+            <JobConfig
+              job={j}
+              isLoading={job.isPending}
+              canWrite={canWrite}
+              isAdmin={isAdmin}
+              onEdit={() => setEditing(true)}
+              onDelete={(force) =>
+                j &&
+                deleteJob.mutate(
+                  { jobId: j.id, force },
+                  {
+                    onSuccess: () => {
+                      toast.push({ tone: 'info', title: `Deleted ${j.code}` });
+                      onBack?.();
+                    },
+                    onError: (err: unknown) => {
+                      const msg = err instanceof Error ? err.message : 'Unknown error';
+                      // 409 with run count → offer force delete via confirm
+                      if (msg.includes('run(s)') && !force) {
+                        if (
+                          window.confirm(
+                            `${msg}\n\nForce-delete anyway? Run history will cascade-delete.`,
+                          )
+                        ) {
+                          deleteJob.mutate(
+                            { jobId: j.id, force: true },
+                            {
+                              onSuccess: () => {
+                                toast.push({ tone: 'info', title: `Deleted ${j.code}` });
+                                onBack?.();
+                              },
+                            },
+                          );
+                        }
+                      } else {
+                        toast.push({
+                          tone: 'danger',
+                          title: 'Delete failed',
+                          description: msg,
+                        });
+                      }
+                    },
+                  },
+                )
+              }
+            />
+          )}
           {tab === 'schema' && j && <JobSchema jobId={j.id} />}
           {tab === 'history' && j && (
             <JobHistory jobId={j.id} jobCode={j.code} onOpenRun={onOpenRun} />
@@ -199,6 +251,18 @@ export function JobDetail({
               description: `Run #${runId}`,
             });
             onOpenRun?.({ runId, jobCode: j.code });
+          }}
+        />
+      )}
+      {editing && j && (
+        <JobEditor
+          me={me}
+          existing={j}
+          onClose={() => setEditing(false)}
+          onSaved={(saved) => {
+            setEditing(false);
+            toast.push({ tone: 'success', title: `Updated ${saved.code}` });
+            job.refetch();
           }}
         />
       )}
@@ -303,7 +367,21 @@ function BackfillDialog({
   );
 }
 
-function JobConfig({ job, isLoading }: { job: ApiJob | undefined; isLoading: boolean }) {
+function JobConfig({
+  job,
+  isLoading,
+  canWrite,
+  isAdmin,
+  onEdit,
+  onDelete,
+}: {
+  job: ApiJob | undefined;
+  isLoading: boolean;
+  canWrite: boolean;
+  isAdmin: boolean;
+  onEdit: () => void;
+  onDelete: (force: boolean) => void;
+}) {
   if (isLoading || !job) {
     return (
       <div className="space-y-2">
@@ -351,8 +429,15 @@ function JobConfig({ job, isLoading }: { job: ApiJob | undefined; isLoading: boo
       <div className="col-span-8 border border-border dark:border-d-border rounded-md bg-surface dark:bg-d-surface">
         <div className="px-4 py-2.5 border-b border-border dark:border-d-border flex items-center justify-between">
           <h3 className="text-base font-medium text-text dark:text-d-text">Configuration</h3>
-          <Button variant="ghost" size="sm" iconLeft={<I.pencil size={12} />}>
-            Edit all
+          <Button
+            variant="ghost"
+            size="sm"
+            iconLeft={<I.pencil size={12} />}
+            disabled={!canWrite}
+            title={canWrite ? undefined : 'Read-only role'}
+            onClick={onEdit}
+          >
+            Edit
           </Button>
         </div>
         <dl>
@@ -384,6 +469,8 @@ function JobConfig({ job, isLoading }: { job: ApiJob | undefined; isLoading: boo
               size="sm"
               className="w-full justify-start"
               iconLeft={<I.refresh size={12} />}
+              disabled
+              title="Watermark reset is pending (manual SQL update for now)"
             >
               Reset watermark
             </Button>
@@ -392,14 +479,26 @@ function JobConfig({ job, isLoading }: { job: ApiJob | undefined; isLoading: boo
               size="sm"
               className="w-full justify-start"
               iconLeft={<I.copy size={12} />}
+              disabled={!canWrite}
+              onClick={() => {
+                if (!job) return;
+                // Clone = open the editor with a blank code + every other
+                // field pre-filled. Implemented by passing existing but
+                // letting the user re-type the code.
+                navigator.clipboard?.writeText(job.code);
+              }}
+              title="Copies the code; paste it into a new job's editor as a starting point"
             >
-              Clone job
+              Copy code
             </Button>
             <Button
               variant="ghost"
               size="sm"
               className="w-full justify-start text-danger hover:bg-danger/10 hover:text-danger"
               iconLeft={<I.x size={12} />}
+              disabled={!isAdmin}
+              title={isAdmin ? undefined : 'Admin only'}
+              onClick={() => onDelete(false)}
             >
               Delete job
             </Button>

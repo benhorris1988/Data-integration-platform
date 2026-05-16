@@ -25,6 +25,7 @@ import {
 import { formatInt, formatRelative } from '../api/format';
 import type { ApiJobListItem, ApiMe, RunStatus } from '../api/types';
 import type { JobRef } from '../App';
+import { JobEditor } from './JobEditor';
 
 type Props = {
   me: ApiMe;
@@ -56,6 +57,7 @@ export function JobsIndex({ me, onOpenJob, onOpenRun }: Props) {
   });
   const [selection, setSelection] = useState<Set<number>>(new Set());
   const [hoverRow, setHoverRow] = useState<number | null>(null);
+  const [newJobOpen, setNewJobOpen] = useState(false);
 
   const filters: JobsFilters = useMemo(
     () => ({
@@ -203,13 +205,9 @@ export function JobsIndex({ me, onOpenJob, onOpenRun }: Props) {
               variant="primary"
               size="md"
               iconLeft={<I.plus size={14} />}
-              onClick={() =>
-                toast.push({
-                  tone: 'info',
-                  title: 'Job authoring not wired yet',
-                  description: 'POST /api/jobs hasn’t been built; use migrations for now.',
-                })
-              }
+              disabled={!canWrite}
+              title={canWrite ? undefined : 'Read-only role'}
+              onClick={() => setNewJobOpen(true)}
             >
               New job
             </Button>
@@ -564,6 +562,23 @@ export function JobsIndex({ me, onOpenJob, onOpenRun }: Props) {
             </table>
           )}
         </div>
+
+        {newJobOpen && (
+          <JobEditor
+            me={me}
+            onClose={() => setNewJobOpen(false)}
+            onSaved={(j) => {
+              setNewJobOpen(false);
+              toast.push({
+                tone: 'success',
+                title: `Created ${j.code}`,
+                description: 'Open the job to verify and trigger the first run.',
+              });
+              jobs.refetch();
+              onOpenJob?.({ jobId: j.id, jobCode: j.code });
+            }}
+          />
+        )}
 
         {/* Footer */}
         {!isLoading && !isError && rows.length > 0 && (

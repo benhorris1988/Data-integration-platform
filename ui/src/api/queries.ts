@@ -108,6 +108,73 @@ export function useRunJob() {
   });
 }
 
+// Shape sent to POST /api/jobs and PUT /api/jobs/:id. Matches JobBody on
+// the server.
+export type ApiJobBody = {
+  code: string;
+  source_id: string;
+  source_object: string;
+  source_query: string | null;
+  target_schema: string;
+  target_table: string;
+  strategy: 'full_snapshot' | 'append' | 'watermark_delta' | 'truncate_and_load';
+  schedule: string;
+  watermark_column: string | null;
+  watermark_grace_sec: number;
+  batch_size: number;
+  retries: number;
+  timeout_sec: number;
+  owner: string;
+  enabled: boolean;
+};
+
+export function useCreateJob() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ApiJobBody) =>
+      request<ApiJob>('/api/jobs', { method: 'POST', body: JSON.stringify(body) }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['jobs'] }),
+  });
+}
+
+export function useUpdateJob() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ jobId, body }: { jobId: number; body: ApiJobBody }) =>
+      request<ApiJob>(`/api/jobs/${jobId}`, {
+        method: 'PUT',
+        body: JSON.stringify(body),
+      }),
+    onSuccess: (_d, vars) => {
+      qc.invalidateQueries({ queryKey: ['jobs'] });
+      qc.invalidateQueries({ queryKey: ['job', vars.jobId] });
+    },
+  });
+}
+
+export function useDeleteJob() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ jobId, force = false }: { jobId: number; force?: boolean }) =>
+      request<void>(`/api/jobs/${jobId}${force ? '?force=true' : ''}`, {
+        method: 'DELETE',
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['jobs'] }),
+  });
+}
+
+export function useSetPinned() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ jobId, pinned }: { jobId: number; pinned: boolean }) =>
+      request<{ pinned: boolean }>(`/api/jobs/${jobId}/pin`, {
+        method: 'POST',
+        body: JSON.stringify({ pinned }),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['jobs'] }),
+  });
+}
+
 export function useToggleJob() {
   const qc = useQueryClient();
   return useMutation({
