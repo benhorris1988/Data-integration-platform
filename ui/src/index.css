@@ -1,0 +1,90 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+html,
+body,
+#root {
+  height: 100%;
+}
+
+body {
+  font-family: 'Inter', system-ui, sans-serif;
+  background: #fafafa;
+  color: #18181b;
+  -webkit-font-smoothing: antialiased;
+}
+
+html.dark body {
+  background: #0a0a0b;
+  color: #fafafa;
+}
+
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #d4d4d8;
+  border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: content-box;
+}
+html.dark ::-webkit-scrollbar-thumb {
+  background: #3f3f46;
+  background-clip: content-box;
+  border: 2px solid transparent;
+}
+
+:focus-visible {
+  outline: 2px solid #2563eb;
+  outline-offset: 1px;
+}
+
+.lb-skeleton {
+  background: linear-gradient(90deg, #f4f4f5 0px, #e4e4e7 80px, #f4f4f5 160px);
+  background-size: 200px 100%;
+  animation: lb-shimmer 1.2s ease-in-out infinite;
+}
+html.dark .lb-skeleton {
+  background: linear-gradient(90deg, #18181b 0px, #27272a 80px, #18181b 160px);
+  background-size: 200px 100%;
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
+}
+
+@keyframes lb-pulse {
+  0%,
+  100% {
+    box-shadow: 0 0 0 0 rgba(37, 99, 235, 0.5);
+  }
+  50% {
+    box-shadow: 0 0 0 6px rgba(37, 99, 235, 0);
+  }
+}
+.lb-pulse {
+  animation: lb-pulse 1.6s ease-out infinite;
+}
+
+@keyframes lb-spin {
+  to {
+    transform: rotate(360deg);
+  }
+}
+.lb-spin {
+  animation: lb-spin 0.7s linear infinite;
+}
+
+@keyframes lb-shimmer {
+  0% {
+    background-position: -200px 0;
+  }
+  100% {
+    background-position: calc(200px + 100%) 0;
+  }
+}

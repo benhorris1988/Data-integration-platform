@@ -4,17 +4,41 @@ Internal operator console for moving data from IFS Applications (Oracle-backed E
 
 Small audience (<12 data engineers and migration leads), runs on corporate networks only, never public-facing.
 
-## Status
-
-Pre-implementation. The UI design brief lives in [`docs/design/lakebridge-ui-brief.md`](docs/design/lakebridge-ui-brief.md) and is the source of truth for the operator console look-and-feel. The UI itself will be produced via Claude Design from that brief; the resulting React manifest will land in this repo once delivered.
-
-## Layout (planned)
+## Layout
 
 ```
-docs/                Design briefs, ADRs, runbooks
-ui/                  React operator console (Claude Design output)
-services/            Lakebridge orchestrator, extractors, loaders
-db/                  Migrations and schema for the platform's own metadata
+docs/
+  design/
+    lakebridge-ui-brief.md       canonical UI design brief (the source)
+    manifest/                    Claude Design output — design reference
+db/
+  migrations/                    numbered T-SQL applied in order
+  staging/                       conventions + a worked example
+services/
+  orchestrator/                  Python 3.12 + FastAPI service:
+                                   API the UI calls, runner that moves IFS
+                                   data, scheduler that fires cron jobs
+ui/                              React + TS + Vite operator console
 ```
 
-Nothing below `ui/` or `services/` exists yet — the repo currently holds the design brief and this README only.
+## Running the whole thing locally
+
+```bash
+# 1. SQL Server + orchestrator
+cd services/orchestrator
+cp .env.example .env
+docker compose up --build       # API on :8080, migrations auto-applied
+
+# 2. UI (separate terminal)
+cd ui && npm install && npm run dev   # :5173, talks to the API above
+```
+
+## Components
+
+- **UI** — every screen the brief calls out, dark mode, ⌘K command palette.
+  See [`ui/README.md`](ui/README.md).
+- **DB** — single SQL Server instance hosts both `lakebridge.*` metadata
+  and `stg_ifs_*.*` staging tables. See [`db/README.md`](db/README.md).
+- **Orchestrator** — FastAPI API + cron + queue worker + extraction engine
+  (Oracle → SQL Server via python-oracledb + pyodbc). See
+  [`services/orchestrator/README.md`](services/orchestrator/README.md).

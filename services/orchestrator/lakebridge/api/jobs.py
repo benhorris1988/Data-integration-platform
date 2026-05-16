@@ -1,0 +1,730 @@
+"""/api/jobs — list, detail, trigger, enable/disable, CRUD.
+
+All endpoints require a signed-in user. State-changing endpoints (run /
+enable / disable / create / update / delete) require Operator or Admin.
+"""
+
+from __future__ import annotations
+
+import re
+from typing import Annotated, Any, Literal
+
+from croniter import croniter
+from fastapi import APIRouter, Depends, HTTPException, Query, status
+from pydantic import BaseModel, Field, field_validator
+
+from .. import auth, db
+from ..models import Job, JobListItem, Run, Strategy
+from ..secrets import get_resolver
+from .runs import enqueue_run
+
+# Codes must be dotted, uppercase, no spaces — operator's primary handle.
+# Loose enough to be ergonomic (length 4..120) but tight enough that the
+# audit log stays scannable.
+_JOB_CODE_RE = re.compile(r"^[A-Z][A-Z0-9_]*(?:\.[A-Z][A-Z0-9_]*)+$")
+
+router = APIRouter(prefix="/api/jobs", tags=["jobs"])
+
+
+# `triggered_by` is no longer accepted from the client — the server fills
+# it from the session. The body carries run mode and (for backfill) the
+# watermark window to replay.
+class RunNowBody(BaseModel):
+    run_mode: str = "manual"  # "manual" | "backfill"
+    # Inclusive lower bound, exclusive upper. Both are required when
+    # run_mode="backfill"; ignored for "manual".
+    backfill_from: str | None = None
+    backfill_to: str | None = None
+
+
+@router.get("", response_model=list[JobListItem])
+def list_jobs(
+    _: Annotated[auth.User, Depends(auth.current_user)],
+    status_filter: list[str] | None = Query(default=None, alias="status"),
+    schedule: str | None = None,
+    source_id: str | None = None,
+    q: str | None = None,
+    limit: int = Query(default=200, le=500),
+) -> list[JobListItem]:
+    """Return jobs joined to their last run, optionally filtered. Mirrors
+    the Jobs index filter bar."""
+    where: list[str] = []
+    params: list[Any] = []
+    if status_filter:
+        placeholders = ", ".join("?" for _ in status_filter)
+        where.append(f"COALESCE(last_run_status, N'queued') IN ({placeholders})")
+        params.extend(status_filter)
+    if schedule == "manual":
+        where.append("schedule = N'manual'")
+    elif schedule == "scheduled":
+        where.append("schedule <> N'manual'")
+    if source_id:
+        where.append("source_id = ?")
+        params.append(source_id)
+    if q:
+        where.append("(code LIKE ? OR source_object LIKE ? OR target_table LIKE ?)")
+        like = f"%{q}%"
+        params.extend([like, like, like])
+    sql = (
+        f"SELECT TOP {limit} * FROM lakebridge.v_jobs_with_last_run"
+        + (" WHERE " + " AND ".join(where) if where else "")
+        + " ORDER BY last_run_finished_at DESC"
+    )
+    rows = db.fetch_all(sql, tuple(params))
+    return [JobListItem.model_validate(r) for r in rows]
+
+
+@router.get("/{job_id}", response_model=Job)
+def get_job(
+    job_id: int,
+    _: Annotated[auth.User, Depends(auth.current_user)],
+) -> Job:
+    row = db.fetch_one(
+        "SELECT id, code, source_id, source_object, target_schema, target_table, "
+        "       strategy, schedule, watermark_column, batch_size, retries, timeout_sec, "
+        "       owner, enabled, pinned "
+        "FROM lakebridge.jobs WHERE id = ?",
+        (job_id,),
+    )
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+    return Job.model_validate(row)
+
+
+@router.get("/{job_id}/runs", response_model=list[Run])
+def list_job_runs(
+    job_id: int,
+    _: Annotated[auth.User, Depends(auth.current_user)],
+    limit: int = Query(default=50, le=500),
+) -> list[Run]:
+    """Run history for one job, newest first."""
+    rows = db.fetch_all(
+        f"SELECT TOP {limit} * FROM lakebridge.v_runs_with_job "
+        "WHERE job_id = ? ORDER BY triggered_at DESC",
+        (job_id,),
+    )
+    return [Run.model_validate(r) for r in rows]
+
+
+class SchemaColumn(BaseModel):
+    name: str
+    data_type: str
+    nullable: bool
+
+
+class SchemaMapping(BaseModel):
+    src: SchemaColumn | None
+    tgt: SchemaColumn | None
+    drift: str | None  # 'cast' | 'new' | 'missing' | None
+
+
+class SchemaResponse(BaseModel):
+    source_object: str
+    target: str
+    source_columns: list[SchemaColumn]
+    target_columns: list[SchemaColumn]
+    mapping: list[SchemaMapping]
+
+
+@router.get("/{job_id}/schema", response_model=SchemaResponse)
+def get_job_schema(
+    job_id: int,
+    _: Annotated[auth.User, Depends(auth.current_user)],
+) -> SchemaResponse:
+    """Compare the source object's columns (Oracle ALL_TAB_COLUMNS) with
+    the target table's columns (SQL Server INFORMATION_SCHEMA.COLUMNS) and
+    return a side-by-side mapping with drift flags.
+
+    drift values:
+      `cast`    — names align but the target type is narrower than the source
+      `new`     — source column has no target column
+      `missing` — target has a column the source doesn't (Lakebridge trailer
+                  columns are filtered out before this comparison)
+    """
+    job = db.fetch_one(
+        "SELECT j.source_object, j.target_schema, j.target_table, "
+        "       s.host, s.port, s.sid, s.service_name, s.username, s.secret_ref, "
+        "       s.tls_required "
+        "FROM lakebridge.jobs j "
+        "JOIN lakebridge.sources s ON s.id = j.source_id "
+        "WHERE j.id = ?",
+        (job_id,),
+    )
+    if job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+    source_columns = _read_source_columns(job)
+    target_columns = _read_target_columns(job)
+    return SchemaResponse(
+        source_object=str(job["source_object"]),
+        target=f"{job['target_schema']}.{job['target_table']}",
+        source_columns=source_columns,
+        target_columns=target_columns,
+        mapping=_diff_columns(source_columns, target_columns),
+    )
+
+
+def _read_source_columns(job: dict[str, Any]) -> list[SchemaColumn]:
+    import oracledb
+
+    from ..runner.sources.oracle import OracleEndpoint
+
+    password = get_resolver().resolve(job["secret_ref"])
+    if not password:
+        raise HTTPException(
+            status.HTTP_503_SERVICE_UNAVAILABLE,
+            f"secret {job['secret_ref']!r} not resolvable",
+        )
+    owner, name = _split_owner(str(job["source_object"]))
+    ep = OracleEndpoint(
+        host=job["host"], port=job["port"], sid=job["sid"],
+        service_name=job["service_name"], user=job["username"],
+        password=password, tls_required=bool(job["tls_required"]),
+    )
+    dsn = (
+        oracledb.makedsn(ep.host, ep.port, service_name=ep.service_name)
+        if ep.service_name
+        else oracledb.makedsn(ep.host, ep.port, sid=ep.sid)
+    )
+    try:
+        conn = oracledb.connect(user=ep.user, password=ep.password, dsn=dsn)
+    except oracledb.DatabaseError as exc:
+        raise HTTPException(
+            status.HTTP_502_BAD_GATEWAY, f"oracle: {str(exc).splitlines()[0][:200]}"
+        ) from exc
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT column_name, data_type, data_length, data_precision, data_scale, nullable "
+                "FROM all_tab_columns WHERE owner = :owner AND table_name = :name "
+                "ORDER BY column_id",
+                {"owner": owner, "name": name},
+            )
+            cols: list[SchemaColumn] = []
+            for row in cur.fetchall():
+                col_name, dtype, length, precision, scale, nullable = row
+                cols.append(
+                    SchemaColumn(
+                        name=str(col_name),
+                        data_type=_format_oracle_type(dtype, length, precision, scale),
+                        nullable=(nullable == "Y"),
+                    )
+                )
+            return cols
+    finally:
+        conn.close()
+
+
+def _read_target_columns(job: dict[str, Any]) -> list[SchemaColumn]:
+    rows = db.fetch_all(
+        "SELECT column_name, data_type, character_maximum_length, "
+        "       numeric_precision, numeric_scale, is_nullable "
+        "FROM INFORMATION_SCHEMA.COLUMNS "
+        "WHERE table_schema = ? AND table_name = ? "
+        "  AND column_name NOT LIKE 'lb\\_%' ESCAPE '\\' "
+        "ORDER BY ordinal_position",
+        (job["target_schema"], job["target_table"]),
+    )
+    return [
+        SchemaColumn(
+            name=str(r["column_name"]),
+            data_type=_format_sqlserver_type(
+                r["data_type"],
+                r["character_maximum_length"],
+                r["numeric_precision"],
+                r["numeric_scale"],
+            ),
+            nullable=(r["is_nullable"] == "YES"),
+        )
+        for r in rows
+    ]
+
+
+def _diff_columns(
+    src: list[SchemaColumn], tgt: list[SchemaColumn]
+) -> list[SchemaMapping]:
+    """Match by case-insensitive name. Cast drift is detected only for the
+    classic NUMBER(22,6) → DECIMAL(18,4) case; anything else returns
+    drift=None unless one side is missing the column entirely."""
+    by_src = {c.name.lower(): c for c in src}
+    by_tgt = {c.name.lower(): c for c in tgt}
+    out: list[SchemaMapping] = []
+    for s in src:
+        t = by_tgt.get(s.name.lower())
+        if t is None:
+            out.append(SchemaMapping(src=s, tgt=None, drift="new"))
+        else:
+            out.append(
+                SchemaMapping(
+                    src=s,
+                    tgt=t,
+                    drift="cast" if _looks_like_cast(s.data_type, t.data_type) else None,
+                )
+            )
+    # Target columns the source doesn't have (rare; usually means the
+    # staging table accreted a column that should be added back into the
+    # source projection).
+    for t in tgt:
+        if t.name.lower() not in by_src:
+            out.append(SchemaMapping(src=None, tgt=t, drift="missing"))
+    return out
+
+
+def _split_owner(qualified: str) -> tuple[str, str]:
+    if "." not in qualified:
+        return ("", qualified.upper())
+    owner, name = qualified.split(".", 1)
+    return owner.upper(), name.upper()
+
+
+def _format_oracle_type(
+    dtype: str, length: int | None, precision: int | None, scale: int | None
+) -> str:
+    dtype = (dtype or "").upper()
+    if dtype.startswith(("VARCHAR2", "NVARCHAR2", "CHAR")) and length:
+        return f"{dtype}({length})"
+    if dtype == "NUMBER":
+        if precision and scale:
+            return f"NUMBER({precision},{scale})"
+        if precision:
+            return f"NUMBER({precision})"
+        return "NUMBER"
+    return dtype
+
+
+def _format_sqlserver_type(
+    dtype: str, length: int | None, precision: int | None, scale: int | None
+) -> str:
+    dtype = (dtype or "").lower()
+    if dtype in {"nvarchar", "varchar", "nchar", "char"} and length:
+        return f"{dtype}({length if length > 0 else 'max'})"
+    if dtype == "decimal" and precision is not None:
+        return f"decimal({precision},{scale or 0})"
+    if dtype in {"datetime2", "datetimeoffset", "time"} and scale is not None:
+        return f"{dtype}({scale})"
+    return dtype
+
+
+def _looks_like_cast(src_type: str, tgt_type: str) -> bool:
+    """Detect classic narrowings: NUMBER(p,s) → decimal(p',s') with smaller p or s."""
+    if src_type.upper().startswith("NUMBER(") and tgt_type.lower().startswith("decimal("):
+        try:
+            sp, ss = src_type[7:-1].split(",")
+            tp, ts = tgt_type[8:-1].split(",")
+            return int(tp) < int(sp) or int(ts) < int(ss)
+        except (ValueError, IndexError):
+            return False
+    return False
+
+
+@router.post("/{job_id}/run", status_code=status.HTTP_202_ACCEPTED)
+def run_now(
+    job_id: int,
+    body: RunNowBody,
+    user: Annotated[auth.User, Depends(auth.RequireOperator)],
+) -> dict[str, int]:
+    """Enqueue a run. The scheduler thread picks it up on the next tick.
+
+    For backfill runs, the body must include both `backfill_from` (inclusive
+    lower bound) and `backfill_to` (exclusive upper). The runner uses them
+    as the WHERE predicate on the source query and does NOT advance the
+    live watermark on success — backfills are out-of-band replays.
+    """
+    job = db.fetch_one(
+        "SELECT id, code, enabled, strategy FROM lakebridge.jobs WHERE id = ?",
+        (job_id,),
+    )
+    if job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+    if not job["enabled"] and body.run_mode != "backfill":
+        raise HTTPException(status.HTTP_409_CONFLICT, "job is disabled")
+    if body.run_mode == "backfill":
+        if job["strategy"] != "watermark_delta":
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "backfill is only valid for watermark_delta jobs",
+            )
+        if not body.backfill_from or not body.backfill_to:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "backfill requires backfill_from and backfill_to",
+            )
+        if body.backfill_from >= body.backfill_to:
+            raise HTTPException(
+                status.HTTP_400_BAD_REQUEST,
+                "backfill_from must be strictly before backfill_to",
+            )
+    run_id = enqueue_run(
+        job_id,
+        triggered_by=user.email,
+        run_mode=body.run_mode,
+        backfill_from=body.backfill_from if body.run_mode == "backfill" else None,
+        backfill_to=body.backfill_to if body.run_mode == "backfill" else None,
+    )
+    auth.audit(
+        user,
+        "job.run_now",
+        str(job["code"]),
+        {
+            "job_id": job_id,
+            "run_id": run_id,
+            "run_mode": body.run_mode,
+            "backfill_from": body.backfill_from,
+            "backfill_to": body.backfill_to,
+        },
+    )
+    return {"run_id": run_id}
+
+
+# ── CRUD ────────────────────────────────────────────────────────────────
+
+
+class JobBody(BaseModel):
+    """Mutable fields of a job. Used for both POST (create) and PUT
+    (update). Constraints mirror the CHECK constraints on `lakebridge.jobs`
+    so the API surfaces a 400 with a useful message before the database
+    has to reject it."""
+
+    code: str = Field(min_length=4, max_length=120)
+    source_id: str = Field(min_length=1, max_length=40)
+    source_object: str = Field(min_length=1, max_length=240)
+    source_query: str | None = None
+    target_schema: str = Field(min_length=1, max_length=80)
+    target_table: str = Field(min_length=1, max_length=80)
+    strategy: Strategy
+    schedule: str = Field(default="manual", max_length=60)
+    watermark_column: str | None = None
+    watermark_grace_sec: int = Field(default=300, ge=0)
+    batch_size: int = Field(default=5000, ge=1, le=1_000_000)
+    retries: int = Field(default=3, ge=0, le=20)
+    timeout_sec: int = Field(default=2700, ge=1)
+    owner: str = Field(min_length=1, max_length=120)
+    enabled: bool = True
+
+    @field_validator("code")
+    @classmethod
+    def _code_shape(cls, v: str) -> str:
+        if not _JOB_CODE_RE.match(v):
+            raise ValueError(
+                "code must be dotted, uppercase letters/digits/underscores "
+                "(e.g. EXT.MAT.MASTER.FULL)"
+            )
+        return v
+
+    @field_validator("schedule")
+    @classmethod
+    def _schedule_valid(cls, v: str) -> str:
+        if v == "manual":
+            return v
+        try:
+            croniter(v)
+        except (ValueError, KeyError) as exc:
+            raise ValueError(f"invalid cron expression: {exc}") from exc
+        return v
+
+    @field_validator("target_schema")
+    @classmethod
+    def _target_schema_prefix(cls, v: str) -> str:
+        if not v.lower().startswith("stg_"):
+            raise ValueError("target_schema must start with stg_")
+        return v
+
+
+def _validate_business_rules(body: JobBody) -> None:
+    """Cross-field validation that doesn't fit a single field_validator."""
+    if body.strategy == "watermark_delta" and not body.watermark_column:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "watermark_delta strategy requires watermark_column",
+        )
+    # The source must already exist — provisioning sources is a separate
+    # operation (Vault path, TLS, pool size).
+    found = db.fetch_one(
+        "SELECT 1 AS x FROM lakebridge.sources WHERE id = ?", (body.source_id,)
+    )
+    if found is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            f"source_id {body.source_id!r} does not exist",
+        )
+
+
+@router.post("", response_model=Job, status_code=status.HTTP_201_CREATED)
+def create_job(
+    body: JobBody,
+    user: Annotated[auth.User, Depends(auth.RequireOperator)],
+) -> Job:
+    """Create a new job. The `code` must be globally unique."""
+    _validate_business_rules(body)
+    # Pre-flight uniqueness check — the DB has a UNIQUE constraint as the
+    # final word, but a friendly 409 beats a generic 500.
+    dup = db.fetch_one("SELECT id FROM lakebridge.jobs WHERE code = ?", (body.code,))
+    if dup is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f"job code {body.code!r} already exists"
+        )
+    with db.connection() as conn, conn.cursor() as cur:
+        cur.execute(
+            "INSERT INTO lakebridge.jobs "
+            "(code, source_id, source_object, source_query, target_schema, target_table, "
+            " strategy, schedule, watermark_column, watermark_grace_sec, batch_size, "
+            " retries, timeout_sec, owner, enabled, created_by, updated_by) "
+            "OUTPUT INSERTED.id "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                body.code, body.source_id, body.source_object, body.source_query,
+                body.target_schema, body.target_table, body.strategy, body.schedule,
+                body.watermark_column, body.watermark_grace_sec, body.batch_size,
+                body.retries, body.timeout_sec, body.owner, body.enabled,
+                user.email, user.email,
+            ),
+        )
+        new_id = int(cur.fetchone()[0])
+        conn.commit()
+    auth.audit(user, "job.create", body.code, {"job_id": new_id})
+    return get_job(new_id, user)  # type: ignore[arg-type]
+
+
+@router.put("/{job_id}", response_model=Job)
+def update_job(
+    job_id: int,
+    body: JobBody,
+    user: Annotated[auth.User, Depends(auth.RequireOperator)],
+) -> Job:
+    """Replace a job's mutable fields. `code` is editable but must remain
+    unique — a rename is a metadata-only change."""
+    _validate_business_rules(body)
+    existing = db.fetch_one(
+        "SELECT id, code FROM lakebridge.jobs WHERE id = ?", (job_id,)
+    )
+    if existing is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+    if body.code != existing["code"]:
+        dup = db.fetch_one(
+            "SELECT id FROM lakebridge.jobs WHERE code = ? AND id <> ?",
+            (body.code, job_id),
+        )
+        if dup is not None:
+            raise HTTPException(
+                status.HTTP_409_CONFLICT, f"job code {body.code!r} already in use"
+            )
+    db.execute(
+        "UPDATE lakebridge.jobs SET "
+        "  code = ?, source_id = ?, source_object = ?, source_query = ?, "
+        "  target_schema = ?, target_table = ?, strategy = ?, schedule = ?, "
+        "  watermark_column = ?, watermark_grace_sec = ?, batch_size = ?, "
+        "  retries = ?, timeout_sec = ?, owner = ?, enabled = ?, "
+        "  updated_at = SYSUTCDATETIME(), updated_by = ? "
+        "WHERE id = ?",
+        (
+            body.code, body.source_id, body.source_object, body.source_query,
+            body.target_schema, body.target_table, body.strategy, body.schedule,
+            body.watermark_column, body.watermark_grace_sec, body.batch_size,
+            body.retries, body.timeout_sec, body.owner, body.enabled,
+            user.email, job_id,
+        ),
+    )
+    auth.audit(
+        user, "job.edit", body.code, {"job_id": job_id, "before_code": existing["code"]}
+    )
+    return get_job(job_id, user)  # type: ignore[arg-type]
+
+
+@router.delete(
+    "/{job_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None
+)
+def delete_job(
+    job_id: int,
+    user: Annotated[auth.User, Depends(auth.RequireAdmin)],
+    force: bool = Query(default=False),
+) -> None:
+    """Delete a job. Refuses if any runs exist for it unless `force=true`
+    is supplied (the runs cascade-delete via ON DELETE CASCADE on the
+    foreign key)."""
+    job = db.fetch_one("SELECT code FROM lakebridge.jobs WHERE id = ?", (job_id,))
+    if job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+    run_count_row = db.fetch_one(
+        "SELECT COUNT(*) AS n FROM lakebridge.runs WHERE job_id = ?", (job_id,)
+    )
+    run_count = int((run_count_row or {}).get("n") or 0)
+    if run_count > 0 and not force:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"job has {run_count} run(s); pass ?force=true to delete anyway",
+        )
+    db.execute("DELETE FROM lakebridge.jobs WHERE id = ?", (job_id,))
+    auth.audit(
+        user, "job.delete", str(job["code"]), {"job_id": job_id, "run_count": run_count}
+    )
+
+
+class WatermarkAdvance(BaseModel):
+    advanced_at: str
+    advanced_by_run_id: int | None
+    watermark_value: str
+
+
+class WatermarkHistoryResponse(BaseModel):
+    job_id: int
+    watermark_column: str | None
+    current_value: str | None
+    advances: list[WatermarkAdvance]
+
+
+@router.get("/{job_id}/watermark-history", response_model=WatermarkHistoryResponse)
+def get_watermark_history(
+    job_id: int,
+    _: Annotated[auth.User, Depends(auth.current_user)],
+    limit: int = Query(default=50, le=500),
+) -> WatermarkHistoryResponse:
+    """Current watermark + the last N advances for a job.
+
+    Each advance is the `(watermark_after, finished_at, run_id)` from a
+    successful run that bumped the watermark. We read it from `runs`
+    rather than maintaining a separate audit log — keeps the source of
+    truth single-rooted.
+    """
+    job = db.fetch_one(
+        "SELECT id, watermark_column FROM lakebridge.jobs WHERE id = ?", (job_id,)
+    )
+    if job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+    current = db.fetch_one(
+        "SELECT watermark_value FROM lakebridge.watermarks WHERE job_id = ?",
+        (job_id,),
+    )
+    advances = db.fetch_all(
+        f"SELECT TOP {limit} finished_at AS advanced_at, id AS advanced_by_run_id, "
+        "       watermark_after AS watermark_value "
+        "FROM lakebridge.runs "
+        "WHERE job_id = ? AND status = N'succeeded' AND watermark_after IS NOT NULL "
+        "  AND run_mode <> N'backfill' "
+        "ORDER BY finished_at DESC",
+        (job_id,),
+    )
+    return WatermarkHistoryResponse(
+        job_id=int(job["id"]),
+        watermark_column=job["watermark_column"],
+        current_value=current["watermark_value"] if current else None,
+        advances=[WatermarkAdvance.model_validate(a) for a in advances],
+    )
+
+
+class ResetWatermarkBody(BaseModel):
+    # New value to set. Empty string clears the watermark (next run reads
+    # all rows). Operators sometimes want this when an upstream backfill
+    # restated old data.
+    value: str | None = None
+
+
+@router.post("/{job_id}/reset-watermark")
+def reset_watermark(
+    job_id: int,
+    body: ResetWatermarkBody,
+    user: Annotated[auth.User, Depends(auth.RequireOperator)],
+) -> dict[str, str | None]:
+    """Force the live watermark to `body.value` (or clear it). The next
+    scheduled or manual run will read from that point forward."""
+    job = db.fetch_one(
+        "SELECT id, code, watermark_column FROM lakebridge.jobs WHERE id = ?",
+        (job_id,),
+    )
+    if job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+    if job["watermark_column"] is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "job does not use a watermark — nothing to reset",
+        )
+    if body.value:
+        db.execute(
+            """
+            MERGE lakebridge.watermarks AS t
+            USING (SELECT ? AS job_id, ? AS watermark_column, ? AS watermark_value) AS s
+              ON t.job_id = s.job_id
+            WHEN MATCHED THEN
+                UPDATE SET watermark_value = s.watermark_value,
+                           advanced_by_run_id = NULL,
+                           advanced_at = SYSUTCDATETIME()
+            WHEN NOT MATCHED THEN
+                INSERT (job_id, watermark_column, watermark_value, advanced_at)
+                VALUES (s.job_id, s.watermark_column, s.watermark_value, SYSUTCDATETIME());
+            """,
+            (job_id, job["watermark_column"], body.value),
+        )
+    else:
+        db.execute(
+            "DELETE FROM lakebridge.watermarks WHERE job_id = ?", (job_id,)
+        )
+    auth.audit(
+        user,
+        "job.reset_watermark",
+        str(job["code"]),
+        {"job_id": job_id, "new_value": body.value},
+    )
+    return {"value": body.value}
+
+
+class PinBody(BaseModel):
+    pinned: bool
+
+
+@router.post("/{job_id}/pin", response_model=dict[str, bool])
+def set_pinned(
+    job_id: int,
+    body: PinBody,
+    user: Annotated[auth.User, Depends(auth.RequireOperator)],
+) -> dict[str, bool]:
+    """Pin (or un-pin) a job — pinned jobs show up in the sidebar."""
+    job = db.fetch_one("SELECT code FROM lakebridge.jobs WHERE id = ?", (job_id,))
+    if job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+    db.execute(
+        "UPDATE lakebridge.jobs SET pinned = ?, updated_at = SYSUTCDATETIME(), "
+        "                           updated_by = ? "
+        "WHERE id = ?",
+        (1 if body.pinned else 0, user.email, job_id),
+    )
+    auth.audit(
+        user, "job.pin" if body.pinned else "job.unpin", str(job["code"]), {"job_id": job_id}
+    )
+    return {"pinned": body.pinned}
+
+
+_ = Literal  # keep import alive in case future strategy types are added
+
+
+@router.post("/{job_id}/disable")
+def disable(
+    job_id: int,
+    user: Annotated[auth.User, Depends(auth.RequireOperator)],
+) -> dict[str, bool]:
+    job = db.fetch_one("SELECT code FROM lakebridge.jobs WHERE id = ?", (job_id,))
+    if job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+    db.execute(
+        "UPDATE lakebridge.jobs SET enabled = 0, updated_at = SYSUTCDATETIME(), "
+        "                           updated_by = ? "
+        "WHERE id = ?",
+        (user.email, job_id),
+    )
+    auth.audit(user, "job.disable", str(job["code"]), {"job_id": job_id})
+    return {"enabled": False}
+
+
+@router.post("/{job_id}/enable")
+def enable(
+    job_id: int,
+    user: Annotated[auth.User, Depends(auth.RequireOperator)],
+) -> dict[str, bool]:
+    job = db.fetch_one("SELECT code FROM lakebridge.jobs WHERE id = ?", (job_id,))
+    if job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+    db.execute(
+        "UPDATE lakebridge.jobs SET enabled = 1, updated_at = SYSUTCDATETIME(), "
+        "                           updated_by = ? "
+        "WHERE id = ?",
+        (user.email, job_id),
+    )
+    auth.audit(user, "job.enable", str(job["code"]), {"job_id": job_id})
+    return {"enabled": True}
