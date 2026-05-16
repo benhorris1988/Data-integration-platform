@@ -2,18 +2,18 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
 
-from .. import db
+from .. import auth, db
 from ..models import DashboardKPIs
 
 router = APIRouter(prefix="/api/dashboard", tags=["dashboard"])
 
 
 @router.get("/kpis", response_model=DashboardKPIs)
-def kpis() -> DashboardKPIs:
+def kpis(_: Annotated[auth.User, Depends(auth.current_user)]) -> DashboardKPIs:
     """Top four cards on the Overview screen. One DB hit each — small N."""
     runs_24h = int(
         (db.fetch_one(
@@ -82,7 +82,9 @@ def kpis() -> DashboardKPIs:
 
 
 @router.get("/timeline")
-def timeline() -> list[dict[str, Any]]:
+def timeline(
+    _: Annotated[auth.User, Depends(auth.current_user)],
+) -> list[dict[str, Any]]:
     """24h activity strip — one entry per run, oldest-first."""
     rows = db.fetch_all(
         "SELECT id, job_code, status, "
@@ -96,7 +98,10 @@ def timeline() -> list[dict[str, Any]]:
 
 
 @router.get("/errors-recent")
-def errors_recent(limit: int = 10) -> list[dict[str, Any]]:
+def errors_recent(
+    _: Annotated[auth.User, Depends(auth.current_user)],
+    limit: int = 10,
+) -> list[dict[str, Any]]:
     return db.fetch_all(
         f"SELECT TOP {limit} re.id, re.run_id, re.severity, re.code, re.message, "
         "       re.captured_at, j.code AS job_code "

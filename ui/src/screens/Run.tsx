@@ -28,6 +28,7 @@ import {
   formatRelative,
 } from '../api/format';
 import type {
+  ApiMe,
   ApiRun,
   ApiRunError,
   ApiRunStep,
@@ -36,6 +37,7 @@ import type {
 import type { RunRef } from '../App';
 
 type Props = {
+  me: ApiMe;
   runRef?: RunRef;
   onBack?: () => void;
 };
@@ -49,9 +51,7 @@ const STEP_ORDER: StepName[] = [
   'finalize',
 ];
 
-const CURRENT_OPERATOR = 'priya.iyer';
-
-export function RunDetail({ runRef, onBack }: Props) {
+export function RunDetail({ me, runRef, onBack }: Props) {
   const toast = useToast();
   const qc = useQueryClient();
 
@@ -72,20 +72,23 @@ export function RunDetail({ runRef, onBack }: Props) {
     );
   }
 
-  return <RunDetailContent runRef={runRef} onBack={onBack} toast={toast} qc={qc} />;
+  return <RunDetailContent me={me} runRef={runRef} onBack={onBack} toast={toast} qc={qc} />;
 }
 
 function RunDetailContent({
+  me,
   runRef,
   onBack,
   toast,
   qc,
 }: {
+  me: ApiMe;
   runRef: RunRef;
   onBack?: () => void;
   toast: ReturnType<typeof useToast>;
   qc: ReturnType<typeof useQueryClient>;
 }) {
+  const canWrite = me.role !== 'Read-only';
   const [tab, setTab] = useState<'summary' | 'errors' | 'recon' | 'log'>('summary');
 
   // Polling fallback: when the run is in-flight we re-poll every 2s in case
@@ -197,7 +200,8 @@ function RunDetailContent({
               variant="secondary"
               size="md"
               iconLeft={<I.x size={14} />}
-              disabled={!isInFlight}
+              disabled={!isInFlight || !canWrite}
+              title={canWrite ? undefined : 'Read-only role'}
               loading={cancelRun.isPending}
               onClick={() =>
                 cancelRun.mutate(r.id, {
@@ -212,10 +216,12 @@ function RunDetailContent({
               variant="primary"
               size="md"
               iconLeft={<I.refresh size={14} />}
+              disabled={!canWrite}
+              title={canWrite ? undefined : 'Read-only role'}
               loading={runJob.isPending}
               onClick={() =>
                 runJob.mutate(
-                  { jobId: r.job_id, triggeredBy: CURRENT_OPERATOR },
+                  { jobId: r.job_id },
                   {
                     onSuccess: () =>
                       toast.push({

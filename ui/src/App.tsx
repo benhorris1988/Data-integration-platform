@@ -18,7 +18,8 @@ import {
   ToastProvider,
   useClickAway,
 } from './components/primitives';
-import { useHealth, useJobs, useSources } from './api/queries';
+import { useHealth, useJobs, useLogout, useMe, useSources } from './api/queries';
+import type { ApiMe } from './api/types';
 import { JobsIndex } from './screens/Jobs';
 import { RunDetail } from './screens/Run';
 import { Dashboard } from './screens/Dashboard';
@@ -82,7 +83,9 @@ export default function App() {
     localStorage.setItem('lb-theme', theme);
   }, [theme]);
 
-  const [signedIn, setSignedIn] = useState(true);
+  // The signed-in state is now driven entirely by /api/me. A 401 means
+  // we're not signed in; the sign-in screen handles the rest.
+  const me = useMe();
   const [route, setRoute] = useState<Route>({ name: 'jobs' });
   const [paletteOpen, setPaletteOpen] = useState(false);
 
@@ -106,10 +109,23 @@ export default function App() {
     setRoute({ name } as Route);
   };
 
-  if (!signedIn) {
+  // While we're checking the session show a minimal splash. If the call
+  // failed (401 most likely) drop straight to the sign-in screen.
+  if (me.isPending) {
     return (
       <ToastProvider>
-        <SignIn onSignedIn={() => setSignedIn(true)} />
+        <div className="h-full w-full flex items-center justify-center bg-bg dark:bg-d-bg">
+          <span className="text-sm text-text-muted dark:text-d-text-muted">
+            Checking session…
+          </span>
+        </div>
+      </ToastProvider>
+    );
+  }
+  if (me.isError || !me.data) {
+    return (
+      <ToastProvider>
+        <SignIn />
       </ToastProvider>
     );
   }
@@ -117,7 +133,13 @@ export default function App() {
   return (
     <ToastProvider>
       <div className="h-full w-full flex bg-bg dark:bg-d-bg text-text dark:text-d-text">
-        <Sidebar route={route} navTo={navTo} openJob={openJob} onOpenPalette={() => setPaletteOpen(true)} />
+        <Sidebar
+          me={me.data}
+          route={route}
+          navTo={navTo}
+          openJob={openJob}
+          onOpenPalette={() => setPaletteOpen(true)}
+        />
         <div className="flex-1 min-w-0 flex flex-col">
           <TopBar
             route={route}
@@ -130,21 +152,26 @@ export default function App() {
               <Dashboard onOpenJob={openJob} onOpenRun={openRun} />
             )}
             {route.name === 'jobs' && (
-              <JobsIndex onOpenJob={openJob} onOpenRun={openRun} />
+              <JobsIndex me={me.data} onOpenJob={openJob} onOpenRun={openRun} />
             )}
             {route.name === 'runs' && (
-              <RunDetail runRef={route.ref} onBack={() => setRoute({ name: 'jobs' })} />
+              <RunDetail
+                me={me.data}
+                runRef={route.ref}
+                onBack={() => setRoute({ name: 'jobs' })}
+              />
             )}
             {route.name === 'job-detail' && (
               <JobDetail
+                me={me.data}
                 jobRef={route.ref}
                 onBack={() => setRoute({ name: 'jobs' })}
                 onOpenRun={openRun}
               />
             )}
-            {route.name === 'sources' && <SourcesScreen />}
+            {route.name === 'sources' && <SourcesScreen me={me.data} />}
             {route.name === 'recon' && <ReconScreen onOpenJob={openJob} />}
-            {route.name === 'settings' && <SettingsScreen />}
+            {route.name === 'settings' && <SettingsScreen me={me.data} />}
           </main>
         </div>
       </div>
@@ -161,11 +188,13 @@ export default function App() {
 }
 
 function Sidebar({
+  me,
   route,
   navTo,
   openJob,
   onOpenPalette,
 }: {
+  me: ApiMe;
   route: Route;
   navTo: (name: RouteName) => void;
   openJob: (ref: JobRef) => void;
@@ -174,7 +203,13 @@ function Sidebar({
   // Hit the API for the sidebar's job count and pinned list — the data is
   // already cached when the operator navigates to the Jobs index.
   const jobs = useJobs();
+  const logout = useLogout();
   const pinned = (jobs.data ?? []).filter((j) => j.pinned).slice(0, 4);
+  const initials = me.name
+    .split(/\s+/)
+    .map((p) => p[0]?.toUpperCase() ?? '')
+    .slice(0, 2)
+    .join('');
 
   return (
     <aside className="w-60 shrink-0 bg-surface dark:bg-d-surface border-r border-border dark:border-d-border flex flex-col">
@@ -249,16 +284,27 @@ function Sidebar({
       <div className="border-t border-border dark:border-d-border p-3">
         <div className="flex items-center gap-2">
           <div className="w-7 h-7 rounded-sm bg-surface-2 dark:bg-d-surface-2 border border-border dark:border-d-border flex items-center justify-center text-xs font-mono text-text dark:text-d-text">
-            PI
+            {initials || '··'}
           </div>
           <div className="flex-1 min-w-0 leading-tight">
-            <div className="text-sm text-text dark:text-d-text truncate">Priya Iyer</div>
+            <div className="text-sm text-text dark:text-d-text truncate">{me.name}</div>
             <div className="text-xs text-text-subtle dark:text-d-text-subtle truncate">
-              Admin · Okta SSO
+              {me.role} ·{' '}
+              {me.auth_mode === 'oidc'
+                ? 'Okta SSO'
+                : me.auth_mode === 'dev'
+                ? 'dev session'
+                : 'auth disabled'}
             </div>
           </div>
-          <button className="text-text-subtle hover:text-text dark:text-d-text-subtle dark:hover:text-d-text">
-            <I.more size={14} />
+          <button
+            onClick={() => logout.mutate()}
+            disabled={logout.isPending}
+            title="Sign out"
+            className="text-text-subtle hover:text-text dark:text-d-text-subtle dark:hover:text-d-text disabled:opacity-50"
+            aria-label="Sign out"
+          >
+            <I.logOut size={14} />
           </button>
         </div>
       </div>

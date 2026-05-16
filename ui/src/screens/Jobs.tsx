@@ -23,17 +23,14 @@ import {
   type JobsFilters,
 } from '../api/queries';
 import { formatInt, formatRelative } from '../api/format';
-import type { ApiJobListItem, RunStatus } from '../api/types';
+import type { ApiJobListItem, ApiMe, RunStatus } from '../api/types';
 import type { JobRef } from '../App';
 
 type Props = {
+  me: ApiMe;
   onOpenJob?: (ref: JobRef) => void;
   onOpenRun?: (ref: { runId: number; jobCode?: string }) => void;
 };
-
-// The signed-in operator drives `triggered_by` on manual runs. Once auth is
-// wired we read this from the JWT/session; for now it's a placeholder.
-const CURRENT_OPERATOR = 'priya.iyer';
 
 type SortKey =
   | 'code'
@@ -45,8 +42,9 @@ type SortKey =
   | 'last_run_rows'
   | 'last_run_status';
 
-export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
+export function JobsIndex({ me, onOpenJob, onOpenRun }: Props) {
   const toast = useToast();
+  const canWrite = me.role !== 'Read-only';
   const [density, setDensity] = useState<'default' | 'compact'>('default');
   const [query, setQuery] = useState('');
   const [statusFilter, setStatusFilter] = useState<Set<RunStatus>>(new Set());
@@ -136,7 +134,7 @@ export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
 
   const handleRunNow = (j: ApiJobListItem) => {
     runJob.mutate(
-      { jobId: j.id, triggeredBy: CURRENT_OPERATOR },
+      { jobId: j.id },
       {
         onSuccess: (data) => {
           toast.push({
@@ -263,11 +261,10 @@ export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
                 variant="ghost"
                 size="sm"
                 iconLeft={<I.play size={12} />}
+                disabled={!canWrite}
                 onClick={() => {
                   const targets = rows.filter((r) => selection.has(r.id));
-                  targets.forEach((j) =>
-                    runJob.mutate({ jobId: j.id, triggeredBy: CURRENT_OPERATOR }),
-                  );
+                  targets.forEach((j) => runJob.mutate({ jobId: j.id }));
                   toast.push({
                     tone: 'info',
                     title: `${targets.length} jobs queued`,
@@ -507,11 +504,15 @@ export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
                                   </button>
                                 }
                                 items={[
-                                  {
-                                    label: 'Run now',
-                                    icon: <I.play size={14} />,
-                                    onClick: () => handleRunNow(j),
-                                  },
+                                  ...(canWrite
+                                    ? [
+                                        {
+                                          label: 'Run now',
+                                          icon: <I.play size={14} />,
+                                          onClick: () => handleRunNow(j),
+                                        },
+                                      ]
+                                    : []),
                                   {
                                     label: 'View latest run',
                                     icon: <I.externalLink size={14} />,
@@ -520,18 +521,30 @@ export function JobsIndex({ onOpenJob, onOpenRun }: Props) {
                                       onOpenRun?.({ runId: j.last_run_id, jobCode: j.code }),
                                   },
                                   { label: 'Edit configuration', icon: <I.pencil size={14} /> },
-                                  { label: 'Copy code', icon: <I.copy size={14} />, kbd: '⌘C',
+                                  {
+                                    label: 'Copy code',
+                                    icon: <I.copy size={14} />,
+                                    kbd: '⌘C',
                                     onClick: () => {
                                       navigator.clipboard?.writeText(j.code);
                                       toast.push({ tone: 'info', title: 'Copied to clipboard' });
-                                    } },
-                                  { divider: true },
-                                  {
-                                    label: j.enabled ? 'Disable job' : 'Enable job',
-                                    icon: <I.pause size={14} />,
-                                    onClick: () => handleToggleEnabled(j),
+                                    },
                                   },
-                                  { label: 'Delete', icon: <I.x size={14} />, danger: true },
+                                  ...(canWrite
+                                    ? [
+                                        { divider: true } as const,
+                                        {
+                                          label: j.enabled ? 'Disable job' : 'Enable job',
+                                          icon: <I.pause size={14} />,
+                                          onClick: () => handleToggleEnabled(j),
+                                        },
+                                        {
+                                          label: 'Delete',
+                                          icon: <I.x size={14} />,
+                                          danger: true,
+                                        },
+                                      ]
+                                    : []),
                                 ]}
                               />
                             )}

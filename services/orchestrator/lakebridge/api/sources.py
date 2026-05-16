@@ -4,11 +4,12 @@ from __future__ import annotations
 
 import os
 import time
+from typing import Annotated
 
 import oracledb
-from fastapi import APIRouter, HTTPException, status
+from fastapi import APIRouter, Depends, HTTPException, status
 
-from .. import db
+from .. import auth, db
 from ..logging import get_logger
 from ..models import Source, TestConnectionResult
 from ..runner.sources.oracle import OracleEndpoint
@@ -19,7 +20,9 @@ log = get_logger("lakebridge.api.sources")
 
 
 @router.get("", response_model=list[Source])
-def list_sources() -> list[Source]:
+def list_sources(
+    _: Annotated[auth.User, Depends(auth.current_user)],
+) -> list[Source]:
     rows = db.fetch_all(
         "SELECT id, host, port, sid, service_name, oracle_version, username, "
         "       secret_ref, tls_required, pool_size, status, last_tested_at, last_test_msg "
@@ -29,7 +32,10 @@ def list_sources() -> list[Source]:
 
 
 @router.get("/{source_id}", response_model=Source)
-def get_source(source_id: str) -> Source:
+def get_source(
+    source_id: str,
+    _: Annotated[auth.User, Depends(auth.current_user)],
+) -> Source:
     row = db.fetch_one(
         "SELECT id, host, port, sid, service_name, oracle_version, username, "
         "       secret_ref, tls_required, pool_size, status, last_tested_at, last_test_msg "
@@ -42,7 +48,10 @@ def get_source(source_id: str) -> Source:
 
 
 @router.post("/{source_id}/test-connection", response_model=TestConnectionResult)
-def test_connection(source_id: str) -> TestConnectionResult:
+def test_connection(
+    source_id: str,
+    user: Annotated[auth.User, Depends(auth.RequireOperator)],
+) -> TestConnectionResult:
     row = db.fetch_one(
         "SELECT host, port, sid, service_name, username, secret_ref, tls_required "
         "FROM lakebridge.sources WHERE id = ?",
@@ -100,4 +109,5 @@ def test_connection(source_id: str) -> TestConnectionResult:
         "                              last_test_msg = ? WHERE id = ?",
         ("ok", msg, source_id),
     )
+    auth.audit(user, "source.test", source_id, {"latency_ms": elapsed, "ok": True})
     return TestConnectionResult(ok=True, latency_ms=elapsed, message=msg)

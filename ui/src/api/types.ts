@@ -209,3 +209,17 @@ export type ApiTestConnectionResult = {
   latency_ms: number;
   message: string;
 };
+
+export type ApiMe = {
+  id: number;
+  email: string;
+  name: string;
+  role: Role;
+  auth_mode: 'oidc' | 'dev' | 'disabled';
+};
+
+export type ApiAuthConfig = {
+  mode: 'oidc' | 'dev' | 'disabled';
+  okta_login_url: string | null;
+  dev_users: string[];
+};

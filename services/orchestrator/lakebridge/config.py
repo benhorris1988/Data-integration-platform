@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from functools import lru_cache
 from pathlib import Path
+from typing import Literal
 
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
@@ -55,6 +56,27 @@ class Settings(BaseSettings):
     api_host: str = "0.0.0.0"
     api_port: int = 8080
     cors_allow_origins: list[str] = ["http://localhost:5173"]
+
+    # ── Authentication ────────────────────────────────────────────────────
+    # auth_mode picks how `/api/me` resolves the current user:
+    #   "oidc"     — verify Okta ID tokens; mint our own session cookie
+    #   "dev"      — allow `/api/auth/dev-session` to stamp a session as
+    #                any seeded user. Do NOT use in production.
+    #   "disabled" — every request becomes anonymous Admin. Use only for
+    #                tests and CI smoke runs.
+    auth_mode: Literal["oidc", "dev", "disabled"] = "dev"
+    # Signing key for the session cookie. Rotate by changing this value;
+    # existing sessions are invalidated on rotation.
+    session_secret: str = "change-me-in-production"
+    session_cookie_name: str = "lb_session"
+    session_max_age_sec: int = 60 * 60 * 8  # 8 hours
+    # OIDC config (only consulted when auth_mode=oidc).
+    oidc_issuer: str | None = None              # e.g. https://corp.okta.com/oauth2/default
+    oidc_client_id: str | None = None
+    oidc_client_secret: str | None = None
+    oidc_audience: str | None = None            # defaults to client_id
+    oidc_redirect_uri: str = "http://localhost:8080/api/auth/callback"
+    oidc_post_login_redirect: str = "http://localhost:5173/"
 
     def odbc_connection_string(self) -> str:
         """Return an ODBC connection string for pyodbc.connect()."""

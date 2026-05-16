@@ -7,8 +7,9 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.middleware.sessions import SessionMiddleware
 
-from .api import audit, dashboard, health, jobs, recon, runs, sources, users
+from .api import audit, auth, dashboard, health, jobs, recon, runs, sources, users
 from .config import get_settings
 from .logging import configure, get_logger
 from .scheduler import start_global_scheduler, stop_global_scheduler
@@ -50,7 +51,18 @@ def create_app() -> FastAPI:
         allow_headers=["*"],
         allow_credentials=True,
     )
+    # SessionMiddleware before the routers — auth.current_user reads
+    # `request.session` which only exists once this is wired.
+    app.add_middleware(
+        SessionMiddleware,
+        secret_key=s.session_secret,
+        session_cookie=s.session_cookie_name,
+        max_age=s.session_max_age_sec,
+        same_site="lax",
+        https_only=False,  # set true when fronted by TLS; dev runs http
+    )
     app.include_router(health.router)
+    app.include_router(auth.router)
     app.include_router(jobs.router)
     app.include_router(runs.router)
     app.include_router(sources.router)

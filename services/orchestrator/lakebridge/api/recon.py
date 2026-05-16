@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter
+from fastapi import APIRouter, Depends
+
+from .. import auth
 
 router = APIRouter(prefix="/api/recon", tags=["recon"])
 
 
 @router.get("")
-def matrix(limit_jobs: int = 14, last_n: int = 6) -> list[dict[str, Any]]:
+def matrix(
+    _: Annotated[auth.User, Depends(auth.current_user)],
+    limit_jobs: int = 14,
+    last_n: int = 6,
+) -> list[dict[str, Any]]:
     """Return up to `limit_jobs` rows, each with the last `last_n` recon
     cells. Shape mirrors the UI's `RECON` constant."""
     from .. import db

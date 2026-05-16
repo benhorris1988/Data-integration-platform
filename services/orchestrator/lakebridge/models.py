@@ -155,7 +155,8 @@ class AuditEntry(_Base):
 
 
 class RunTriggerRequest(BaseModel):
-    triggered_by: str
+    # `triggered_by` is resolved from the session by the server; clients
+    # cannot impersonate other users.
     run_mode: Literal["manual", "backfill"] = "manual"
 
 

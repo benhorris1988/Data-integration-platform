@@ -9,11 +9,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+from typing import Annotated
 
-from fastapi import APIRouter, HTTPException, Request, status
+from fastapi import APIRouter, Depends, HTTPException, Request, status
 from sse_starlette.sse import EventSourceResponse
 
-from .. import db
+from .. import auth, db
 from ..events import bus
 from ..models import Run, RunError, RunStep
 
@@ -34,7 +35,10 @@ def enqueue_run(job_id: int, triggered_by: str, run_mode: str) -> int:
 
 
 @router.get("/{run_id}", response_model=Run)
-def get_run(run_id: int) -> Run:
+def get_run(
+    run_id: int,
+    _: Annotated[auth.User, Depends(auth.current_user)],
+) -> Run:
     row = db.fetch_one(
         "SELECT * FROM lakebridge.v_runs_with_job WHERE id = ?", (run_id,)
     )
@@ -44,7 +48,10 @@ def get_run(run_id: int) -> Run:
 
 
 @router.get("/{run_id}/steps", response_model=list[RunStep])
-def get_steps(run_id: int) -> list[RunStep]:
+def get_steps(
+    run_id: int,
+    _: Annotated[auth.User, Depends(auth.current_user)],
+) -> list[RunStep]:
     rows = db.fetch_all(
         "SELECT run_id, step_no, step_name, status, started_at, finished_at, "
         "       duration_sec, progress_pct, rows_processed, message "
@@ -55,7 +62,11 @@ def get_steps(run_id: int) -> list[RunStep]:
 
 
 @router.get("/{run_id}/errors", response_model=list[RunError])
-def get_errors(run_id: int, limit: int = 200) -> list[RunError]:
+def get_errors(
+    run_id: int,
+    _: Annotated[auth.User, Depends(auth.current_user)],
+    limit: int = 200,
+) -> list[RunError]:
     rows = db.fetch_all(
         f"SELECT TOP {limit} id, run_id, severity, code, step_name, message, "
         "       source_pk, payload_json, captured_at "
@@ -67,17 +78,38 @@ def get_errors(run_id: int, limit: int = 200) -> list[RunError]:
 
 
 @router.post("/{run_id}/cancel")
-def cancel(run_id: int) -> dict[str, bool]:
+def cancel(
+    run_id: int,
+    user: Annotated[auth.User, Depends(auth.RequireOperator)],
+) -> dict[str, bool]:
+    row = db.fetch_one(
+        "SELECT r.status, j.code AS job_code "
+        "FROM lakebridge.runs r JOIN lakebridge.jobs j ON j.id = r.job_id "
+        "WHERE r.id = ?",
+        (run_id,),
+    )
+    if row is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "run not found")
     db.execute(
         "UPDATE lakebridge.runs SET cancel_requested = 1 "
         "WHERE id = ? AND status IN (N'queued', N'running')",
         (run_id,),
     )
+    auth.audit(
+        user,
+        "run.cancel",
+        str(row["job_code"]),
+        {"run_id": run_id, "prior_status": row["status"]},
+    )
     return {"cancel_requested": True}
 
 
 @router.get("/{run_id}/events")
-async def events(run_id: int, request: Request) -> EventSourceResponse:
+async def events(
+    run_id: int,
+    request: Request,
+    _: Annotated[auth.User, Depends(auth.current_user)],
+) -> EventSourceResponse:
     """Server-sent events for a single run. Filters the global event bus
     to events with payload['run_id'] == run_id."""
 

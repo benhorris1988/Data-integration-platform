@@ -70,10 +70,33 @@ src/
     Misc.tsx                 Job detail · Sources · Recon · Settings · Sign-in
 ```
 
+## Authentication
+
+Sign-in state is driven entirely by `GET /api/me`. On load:
+
+- 200 → render the app shell with the returned user.
+- 401 → render the `<SignIn />` screen.
+
+The Sign-in screen reads `GET /api/auth/config` and renders the path the
+orchestrator advertises:
+
+- `mode: "oidc"` → "Continue with Okta" button that redirects to
+  `/api/auth/login?return_to=…`.
+- `mode: "dev"` → a dropdown of seeded users and a "Continue as …" button
+  that POSTs to `/api/auth/dev-session`.
+- `mode: "disabled"` → not rendered (the call to `/api/me` already
+  succeeded as the built-in Admin).
+
+Buttons that mutate state (Run now, Disable, Test connection, Cancel run)
+are disabled for `Read-only` users with a tooltip explaining why. The
+Settings page hides the Users + Audit tabs unless the operator is Admin.
+
+The fetch wrapper sends `credentials: 'include'` so the session cookie
+goes with every request. 401s anywhere bubble up as TanStack Query errors;
+the App-level `useMe()` is the source of truth and re-routes to Sign-in.
+
 ## What's deliberately not wired yet
 
-- **Auth.** Sign-in is a button that flips a local flag. Wire OIDC (Okta)
-  before exposing this outside corp net.
 - **Schema introspection.** The Job detail Schema tab links to a planned
   `/api/jobs/:id/schema` endpoint (Oracle USER_TAB_COLUMNS + SQL Server
   INFORMATION_SCHEMA diff).

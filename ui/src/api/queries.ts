@@ -6,9 +6,11 @@ import { useMutation, useQuery, useQueryClient } from '@tanstack/react-query';
 import { request } from './client';
 import type {
   ApiAuditEntry,
+  ApiAuthConfig,
   ApiDashboardKpis,
   ApiJob,
   ApiJobListItem,
+  ApiMe,
   ApiRecentError,
   ApiReconRow,
   ApiRun,
@@ -65,18 +67,18 @@ export function useJob(jobId: number | undefined) {
 export function useRunJob() {
   const qc = useQueryClient();
   return useMutation({
+    // `triggered_by` is no longer a parameter — the server resolves it
+    // from the session cookie. Clients can't impersonate other users.
     mutationFn: ({
       jobId,
-      triggeredBy,
       runMode = 'manual',
     }: {
       jobId: number;
-      triggeredBy: string;
       runMode?: 'manual' | 'backfill';
     }) =>
       request<{ run_id: number }>(`/api/jobs/${jobId}/run`, {
         method: 'POST',
-        body: JSON.stringify({ triggered_by: triggeredBy, run_mode: runMode }),
+        body: JSON.stringify({ run_mode: runMode }),
       }),
     onSuccess: (_data, vars) => {
       qc.invalidateQueries({ queryKey: ['jobs'] });
@@ -233,5 +235,51 @@ export function useHealth() {
     refetchInterval: 30_000,
     retry: 1,
     staleTime: 10_000,
+  });
+}
+
+// ── Auth ─────────────────────────────────────────────────────────────────
+
+export function useMe() {
+  // `retry: false` because we treat 401 as "not signed in" and want the
+  // outer app to switch to the sign-in screen immediately on first failure
+  // rather than retrying three times silently.
+  return useQuery({
+    queryKey: ['me'],
+    queryFn: () => request<ApiMe>('/api/me'),
+    retry: false,
+    staleTime: 60_000,
+  });
+}
+
+export function useAuthConfig() {
+  return useQuery({
+    queryKey: ['auth-config'],
+    queryFn: () => request<ApiAuthConfig>('/api/auth/config'),
+    staleTime: 5 * 60_000,
+  });
+}
+
+export function useDevSignIn() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (email: string) =>
+      request<ApiMe>('/api/auth/dev-session', {
+        method: 'POST',
+        body: JSON.stringify({ email }),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['me'] }),
+  });
+}
+
+export function useLogout() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => request<{ ok: boolean }>('/api/auth/logout', { method: 'POST' }),
+    onSuccess: () => {
+      // Wipe every cached query on logout so the next user doesn't see
+      // stale data with a different access scope.
+      qc.clear();
+    },
   });
 }

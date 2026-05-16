@@ -14,11 +14,13 @@ import {
 } from '../components/primitives';
 import {
   useAudit,
+  useAuthConfig,
+  useDevSignIn,
   useJob,
   useJobRuns,
+  useReconMatrix,
   useRunJob,
   useSources,
-  useReconMatrix,
   useTestConnection,
   useToggleJob,
   useUsers,
@@ -29,21 +31,22 @@ import {
   formatPercent,
   formatRelative,
 } from '../api/format';
-import type { ApiJob, ApiSource, ReconResult } from '../api/types';
+import type { ApiJob, ApiMe, ApiSource, ReconResult } from '../api/types';
 import type { JobRef, RunRef } from '../App';
-
-const CURRENT_OPERATOR = 'priya.iyer';
 
 // ── Job detail ──────────────────────────────────────────────────────────────
 export function JobDetail({
+  me,
   jobRef,
   onBack,
   onOpenRun,
 }: {
+  me: ApiMe;
   jobRef: JobRef;
   onBack?: () => void;
   onOpenRun?: (ref: RunRef) => void;
 }) {
+  const canWrite = me.role !== 'Read-only';
   const toast = useToast();
   const job = useJob(jobRef.jobId);
   const runJob = useRunJob();
@@ -100,7 +103,8 @@ export function JobDetail({
               variant="ghost"
               size="md"
               iconLeft={<I.pause size={14} />}
-              disabled={!j}
+              disabled={!j || !canWrite}
+              title={canWrite ? undefined : 'Read-only role'}
               loading={toggleJob.isPending}
               onClick={() =>
                 j &&
@@ -122,12 +126,13 @@ export function JobDetail({
               variant="primary"
               size="md"
               iconLeft={<I.play size={14} />}
-              disabled={!j}
+              disabled={!j || !canWrite}
+              title={canWrite ? undefined : 'Read-only role'}
               loading={runJob.isPending}
               onClick={() =>
                 j &&
                 runJob.mutate(
-                  { jobId: j.id, triggeredBy: CURRENT_OPERATOR },
+                  { jobId: j.id },
                   {
                     onSuccess: (data) => {
                       toast.push({
@@ -422,11 +427,12 @@ function JobWatermarks({ job }: { job: ApiJob }) {
 }
 
 // ── Sources ─────────────────────────────────────────────────────────────────
-export function SourcesScreen() {
+export function SourcesScreen({ me }: { me: ApiMe }) {
   const toast = useToast();
   const sources = useSources();
   const test = useTestConnection();
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const canWrite = me.role !== 'Read-only';
 
   const selected: ApiSource | undefined = sources.data?.find(
     (s) => s.id === (selectedId ?? sources.data[0]?.id),
@@ -531,6 +537,8 @@ export function SourcesScreen() {
                     size="sm"
                     iconLeft={<I.zap size={12} />}
                     loading={test.isPending}
+                    disabled={!canWrite}
+                    title={canWrite ? undefined : 'Read-only role'}
                     onClick={() =>
                       test.mutate(selected.id, {
                         onSuccess: (r) =>
@@ -786,8 +794,16 @@ export function ReconScreen({ onOpenJob }: { onOpenJob?: (ref: JobRef) => void }
 }
 
 // ── Settings ────────────────────────────────────────────────────────────────
-export function SettingsScreen() {
-  const [sub, setSub] = useState<'users' | 'sources' | 'audit'>('users');
+export function SettingsScreen({ me }: { me: ApiMe }) {
+  const isAdmin = me.role === 'Admin';
+  // The Users + Audit tabs require Admin; non-admins land on Sources.
+  const initialTab: 'users' | 'sources' | 'audit' = isAdmin ? 'users' : 'sources';
+  const [sub, setSub] = useState<'users' | 'sources' | 'audit'>(initialTab);
+  const tabs = [
+    ...(isAdmin ? [{ value: 'users', label: 'Users' }] : []),
+    { value: 'sources', label: 'Sources' },
+    ...(isAdmin ? [{ value: 'audit', label: 'Audit log' }] : []),
+  ];
   return (
     <div className="flex flex-col h-full">
       <div className="px-8 pt-6 pb-4 border-b border-border dark:border-d-border bg-bg dark:bg-d-bg">
@@ -799,16 +815,12 @@ export function SettingsScreen() {
         <Tabs
           value={sub}
           onChange={(v) => setSub(v as typeof sub)}
-          tabs={[
-            { value: 'users', label: 'Users' },
-            { value: 'sources', label: 'Sources' },
-            { value: 'audit', label: 'Audit log' },
-          ]}
+          tabs={tabs}
         />
         <div className="flex-1 min-h-0 overflow-auto py-4">
-          {sub === 'users' && <UsersTable />}
+          {sub === 'users' && isAdmin && <UsersTable />}
           {sub === 'sources' && <SourcesSettingsTable />}
-          {sub === 'audit' && <AuditTable />}
+          {sub === 'audit' && isAdmin && <AuditTable />}
         </div>
       </div>
     </div>
@@ -1030,10 +1042,24 @@ function AuditTable() {
 }
 
 // ── Sign-in ─────────────────────────────────────────────────────────────────
-export function SignIn({ onSignedIn }: { onSignedIn?: () => void }) {
+export function SignIn() {
+  const config = useAuthConfig();
+  const devSignIn = useDevSignIn();
+  const toast = useToast();
+  const [devEmail, setDevEmail] = useState('');
+
+  // Pick the first seeded user as the default selection once config arrives.
+  if (!devEmail && config.data?.dev_users[0]) {
+    setDevEmail(config.data.dev_users[0]);
+  }
+
+  const mode = config.data?.mode;
+  const oktaUrl = config.data?.okta_login_url;
+  const devUsers = config.data?.dev_users ?? [];
+
   return (
     <div className="min-h-screen w-full flex items-center justify-center bg-bg dark:bg-d-bg">
-      <div className="w-[360px] bg-surface dark:bg-d-surface border border-border dark:border-d-border rounded-md p-6">
+      <div className="w-[400px] bg-surface dark:bg-d-surface border border-border dark:border-d-border rounded-md p-6">
         <div className="flex items-center gap-2 mb-6">
           <LakebridgeMark size={20} />
           <span className="text-sm font-semibold text-text dark:text-d-text tracking-tight">
@@ -1042,26 +1068,90 @@ export function SignIn({ onSignedIn }: { onSignedIn?: () => void }) {
         </div>
         <h1 className="text-lg font-medium text-text dark:text-d-text">Sign in</h1>
         <p className="mt-1 text-sm text-text-muted dark:text-d-text-muted">
-          Use your corporate SSO. Local accounts are disabled.
+          {mode === 'oidc'
+            ? 'Use your corporate SSO. Local accounts are disabled.'
+            : mode === 'dev'
+            ? 'Dev mode — pick a seeded operator to impersonate.'
+            : 'Checking session…'}
         </p>
 
-        <div className="mt-5 space-y-3">
-          <Button
-            variant="primary"
-            size="lg"
-            className="w-full"
-            iconLeft={<I.shield size={14} />}
-            onClick={onSignedIn}
-          >
-            Continue with Okta
-          </Button>
-          <Button variant="secondary" size="lg" className="w-full" iconLeft={<I.key size={14} />}>
-            Continue with security key
-          </Button>
-        </div>
+        {config.isError && (
+          <div className="mt-4">
+            <InlineBanner
+              tone="danger"
+              title="Could not reach lakebridge-api."
+              description={
+                config.error instanceof Error ? config.error.message : 'Unknown error'
+              }
+            />
+          </div>
+        )}
+
+        {mode === 'oidc' && oktaUrl && (
+          <div className="mt-5 space-y-3">
+            <Button
+              variant="primary"
+              size="lg"
+              className="w-full"
+              iconLeft={<I.shield size={14} />}
+              onClick={() => {
+                // Capture where the operator wanted to land after sign-in.
+                window.location.href = `${oktaUrl}?return_to=${encodeURIComponent(
+                  window.location.pathname + window.location.search,
+                )}`;
+              }}
+            >
+              Continue with Okta
+            </Button>
+          </div>
+        )}
+
+        {mode === 'dev' && (
+          <div className="mt-5 space-y-3">
+            <label className="block text-xs uppercase tracking-wide text-text-muted dark:text-d-text-muted">
+              Impersonate
+            </label>
+            <select
+              value={devEmail}
+              onChange={(e) => setDevEmail(e.target.value)}
+              className="w-full h-9 px-2 rounded-sm border border-border-strong dark:border-d-border-strong bg-surface dark:bg-d-surface text-text dark:text-d-text text-sm font-mono"
+            >
+              {devUsers.length === 0 && <option value="">(no users seeded)</option>}
+              {devUsers.map((email) => (
+                <option key={email} value={email}>
+                  {email}
+                </option>
+              ))}
+            </select>
+            <Button
+              variant="primary"
+              size="lg"
+              className="w-full"
+              iconLeft={<I.key size={14} />}
+              loading={devSignIn.isPending}
+              disabled={!devEmail}
+              onClick={() =>
+                devSignIn.mutate(devEmail, {
+                  onError: (err: unknown) =>
+                    toast.push({
+                      tone: 'danger',
+                      title: 'Sign-in failed',
+                      description: err instanceof Error ? err.message : 'Unknown error',
+                    }),
+                })
+              }
+            >
+              Continue as {devEmail || '—'}
+            </Button>
+            <p className="text-xs text-text-subtle dark:text-d-text-subtle">
+              Dev mode is disabled in production builds — the picker won’t appear when
+              <span className="font-mono"> LAKEBRIDGE_AUTH_MODE=oidc</span>.
+            </p>
+          </div>
+        )}
 
         <div className="mt-6 pt-4 border-t border-border dark:border-d-border text-xs text-text-subtle dark:text-d-text-subtle font-mono">
-          <div>build · 2026.05.16-r3142</div>
+          <div>mode · {mode ?? '—'}</div>
           <div>env · prod-eu · region eu-west-1</div>
         </div>
       </div>

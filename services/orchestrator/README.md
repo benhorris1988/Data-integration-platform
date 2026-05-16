@@ -93,10 +93,45 @@ The end-to-end integration path (a real Oracle source + real SQL Server)
 isn't covered in the unit suite because we can't faithfully mock the IFS
 schemas. Use a known-good `IFS-TST` source in a staging deployment.
 
+## Authentication
+
+Three modes, selected by `LAKEBRIDGE_AUTH_MODE`:
+
+- **`oidc`** — Okta SSO. The UI hits `GET /api/auth/login` which redirects
+  to Okta; the callback at `/api/auth/callback` verifies the ID token
+  against the discovery JWKS and mints a server-signed session cookie.
+  Users must already exist in `lakebridge.users` (look-up by email);
+  provisioning is intentionally out-of-band.
+- **`dev`** — `POST /api/auth/dev-session {email}` stamps a session as any
+  seeded user. The Sign-in screen shows a dropdown of `lakebridge.users`.
+  Useful for development; **off-limits in production** (the endpoint
+  returns 404 when `auth_mode != "dev"`).
+- **`disabled`** — every request is anonymous Admin. Tests + CI only.
+
+Routes are gated by role:
+
+| Endpoint                         | Role required           |
+|----------------------------------|-------------------------|
+| `GET /api/health`                | none                    |
+| `GET /api/auth/config`           | none                    |
+| `POST /api/auth/dev-session`     | `auth_mode == "dev"`    |
+| All `GET /api/jobs|runs|sources|dashboard|recon` | signed in       |
+| `POST /api/jobs/:id/run`         | Operator / Admin        |
+| `POST /api/jobs/:id/{enable,disable}` | Operator / Admin   |
+| `POST /api/runs/:id/cancel`      | Operator / Admin        |
+| `POST /api/sources/:id/test-connection` | Operator / Admin |
+| `GET /api/users`                 | Admin                   |
+| `GET /api/audit`                 | Admin                   |
+
+State-changing endpoints write an entry to `lakebridge.audit_log` with the
+session user as `actor`. The client cannot specify `triggered_by` — the
+server resolves it from the cookie, so impersonation isn't possible.
+
 ## Things deliberately not done yet
 
-- **Authentication.** The API is open. Wire OIDC (Okta) at the load
-  balancer or as FastAPI middleware before exposing this.
+- **CSRF for cross-origin POSTs.** SameSite=lax on the session cookie
+  blocks the common case; production deployers behind a proxy that strips
+  the `Origin` header should add a double-submit CSRF token.
 - **Secrets manager.** `LAKEBRIDGE_SECRET_*` env vars stand in for Vault /
   AKV / SM lookups. Replace `os.environ.get(...)` in `api/sources.py` and
   `scheduler._build_job_spec` with a real client.

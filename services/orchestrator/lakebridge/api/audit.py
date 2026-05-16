@@ -2,9 +2,11 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, Query
+from typing import Annotated
 
-from .. import db
+from fastapi import APIRouter, Depends, Query
+
+from .. import auth, db
 from ..models import AuditEntry
 
 router = APIRouter(prefix="/api/audit", tags=["audit"])
@@ -12,6 +14,7 @@ router = APIRouter(prefix="/api/audit", tags=["audit"])
 
 @router.get("", response_model=list[AuditEntry])
 def list_audit(
+    _: Annotated[auth.User, Depends(auth.RequireAdmin)],
     actor: str | None = None,
     action: str | None = None,
     limit: int = Query(default=200, le=1000),
