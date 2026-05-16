@@ -296,6 +296,53 @@ export function useSourceObjects(
   });
 }
 
+// Mutable fields of a source — matches SourceBody on the server.
+export type ApiSourceBody = {
+  id: string;
+  host: string;
+  port: number;
+  sid: string | null;
+  service_name: string | null;
+  oracle_version: string | null;
+  username: string;
+  secret_ref: string;
+  tls_required: boolean;
+  pool_size: number;
+};
+
+export function useCreateSource() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: ApiSourceBody) =>
+      request<ApiSource>('/api/sources', {
+        method: 'POST',
+        body: JSON.stringify(body),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['sources'] }),
+  });
+}
+
+export function useUpdateSource() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, body }: { id: string; body: ApiSourceBody }) =>
+      request<ApiSource>(`/api/sources/${id}`, {
+        method: 'PUT',
+        body: JSON.stringify(body),
+      }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['sources'] }),
+  });
+}
+
+export function useDeleteSource() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) =>
+      request<void>(`/api/sources/${id}`, { method: 'DELETE' }),
+    onSuccess: () => qc.invalidateQueries({ queryKey: ['sources'] }),
+  });
+}
+
 export function useTestConnection() {
   const qc = useQueryClient();
   return useMutation({

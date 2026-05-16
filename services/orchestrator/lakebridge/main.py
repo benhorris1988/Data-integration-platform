@@ -14,6 +14,7 @@ from .config import get_settings
 from .csrf import CsrfMiddleware
 from .logging import configure, get_logger
 from .scheduler import start_global_scheduler, stop_global_scheduler
+from .secrets import configure_from_env as configure_secrets
 
 log = get_logger("lakebridge.main")
 
@@ -28,6 +29,10 @@ async def _lifespan(_app: FastAPI) -> AsyncIterator[None]:
         region=s.region,
         scheduler_enabled=s.scheduler_enabled,
     )
+    # Install the secrets backend before the scheduler starts — the
+    # runner's first job dispatch will call resolve(), and a misconfigured
+    # production deployment should fail loud at boot.
+    configure_secrets()
     if s.scheduler_enabled:
         start_global_scheduler()
     try:

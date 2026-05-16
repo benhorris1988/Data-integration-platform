@@ -1,13 +1,21 @@
-"""/api/sources — list, detail, test-connection."""
+"""/api/sources — list, detail, test-connection, CRUD, object discovery.
+
+Sources hold the connection coordinates for an IFS instance and the
+vault reference (NOT the password) needed to bind a job to it. Mutations
+require Admin because creating a source pins a secret path that may
+already exist in Vault — a typo here grants a job's runner real Oracle
+credentials.
+"""
 
 from __future__ import annotations
 
+import re
 import time
 from typing import Annotated, Any
 
 import oracledb
 from fastapi import APIRouter, Depends, HTTPException, Query, status
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 
 from .. import auth, db
 from ..logging import get_logger
@@ -18,6 +26,10 @@ from ..secrets import get_resolver
 router = APIRouter(prefix="/api/sources", tags=["sources"])
 
 log = get_logger("lakebridge.api.sources")
+
+# Source ids are the operator's primary handle in the UI, audit log, and
+# job spec. Same uppercase / hyphen convention IFS-PRD-EU follows.
+_SOURCE_ID_RE = re.compile(r"^[A-Z][A-Z0-9-]*$")
 
 
 @router.get("", response_model=list[Source])
@@ -202,6 +214,148 @@ def list_objects(
 
 
 # ── Helpers ─────────────────────────────────────────────────────────────
+
+
+# ── CRUD ────────────────────────────────────────────────────────────────
+
+
+class SourceBody(BaseModel):
+    """Mutable fields of a source. Same shape for create (POST) and
+    update (PUT). The `id` is editable on creation only; updates ignore
+    any `id` change and operate on the URL-path id."""
+
+    id: str = Field(min_length=2, max_length=40)
+    host: str = Field(min_length=1, max_length=200)
+    port: int = Field(default=1521, ge=1, le=65535)
+    sid: str | None = Field(default=None, max_length=60)
+    service_name: str | None = Field(default=None, max_length=120)
+    oracle_version: str | None = Field(default=None, max_length=40)
+    username: str = Field(min_length=1, max_length=60)
+    secret_ref: str = Field(min_length=1, max_length=200)
+    tls_required: bool = True
+    pool_size: int = Field(default=8, ge=1, le=64)
+
+    @field_validator("id")
+    @classmethod
+    def _id_shape(cls, v: str) -> str:
+        if not _SOURCE_ID_RE.match(v):
+            raise ValueError(
+                "id must be uppercase letters/digits/hyphens, e.g. IFS-PRD-EU"
+            )
+        return v
+
+    @field_validator("secret_ref")
+    @classmethod
+    def _secret_ref_shape(cls, v: str) -> str:
+        # Vault path style: `<engine>/<path>` with at least one slash.
+        # Allows engine-agnostic refs (AKV uses the value verbatim).
+        if "/" not in v or v.startswith("/") or v.endswith("/"):
+            raise ValueError(
+                "secret_ref should be a vault-style path (e.g. secret/lakebridge/ifs-reader)"
+            )
+        return v
+
+
+def _enforce_endpoint_shape(body: SourceBody) -> None:
+    """Exactly one of sid / service_name must be set."""
+    if bool(body.sid) == bool(body.service_name):
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "exactly one of sid or service_name must be set",
+        )
+
+
+@router.post("", response_model=Source, status_code=status.HTTP_201_CREATED)
+def create_source(
+    body: SourceBody,
+    user: Annotated[auth.User, Depends(auth.RequireAdmin)],
+) -> Source:
+    """Add a new IFS source. Admin only — this writes the vault binding
+    that runner credentials will resolve against."""
+    _enforce_endpoint_shape(body)
+    dup = db.fetch_one("SELECT id FROM lakebridge.sources WHERE id = ?", (body.id,))
+    if dup is not None:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT, f"source {body.id!r} already exists"
+        )
+    db.execute(
+        "INSERT INTO lakebridge.sources "
+        "(id, host, port, sid, service_name, oracle_version, username, secret_ref, "
+        " tls_required, pool_size, created_by, updated_by) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        (
+            body.id, body.host, body.port, body.sid, body.service_name,
+            body.oracle_version, body.username, body.secret_ref,
+            body.tls_required, body.pool_size, user.email, user.email,
+        ),
+    )
+    auth.audit(user, "source.create", body.id, {"host": body.host, "port": body.port})
+    return get_source(body.id, user)  # type: ignore[arg-type]
+
+
+@router.put("/{source_id}", response_model=Source)
+def update_source(
+    source_id: str,
+    body: SourceBody,
+    user: Annotated[auth.User, Depends(auth.RequireAdmin)],
+) -> Source:
+    """Edit an existing source. The path id is authoritative — renaming a
+    source is intentionally not supported (it'd invalidate every job
+    that references it via FK)."""
+    _enforce_endpoint_shape(body)
+    if body.id != source_id:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "renaming a source is not supported; create a new one and rebind jobs",
+        )
+    existing = db.fetch_one(
+        "SELECT id FROM lakebridge.sources WHERE id = ?", (source_id,)
+    )
+    if existing is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "source not found")
+    db.execute(
+        "UPDATE lakebridge.sources SET "
+        "  host = ?, port = ?, sid = ?, service_name = ?, oracle_version = ?, "
+        "  username = ?, secret_ref = ?, tls_required = ?, pool_size = ?, "
+        "  updated_at = SYSUTCDATETIME(), updated_by = ? "
+        "WHERE id = ?",
+        (
+            body.host, body.port, body.sid, body.service_name, body.oracle_version,
+            body.username, body.secret_ref, body.tls_required, body.pool_size,
+            user.email, source_id,
+        ),
+    )
+    auth.audit(user, "source.edit", source_id, {"host": body.host, "port": body.port})
+    return get_source(source_id, user)  # type: ignore[arg-type]
+
+
+@router.delete(
+    "/{source_id}", status_code=status.HTTP_204_NO_CONTENT, response_model=None
+)
+def delete_source(
+    source_id: str,
+    user: Annotated[auth.User, Depends(auth.RequireAdmin)],
+) -> None:
+    """Delete a source. Refuses if any jobs reference it — the operator
+    must reassign them first. No force flag: orphaning a job by deleting
+    its source would silently break the next scheduled run."""
+    existing = db.fetch_one(
+        "SELECT id FROM lakebridge.sources WHERE id = ?", (source_id,)
+    )
+    if existing is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "source not found")
+    refs = db.fetch_one(
+        "SELECT COUNT(*) AS n FROM lakebridge.jobs WHERE source_id = ?",
+        (source_id,),
+    )
+    n = int((refs or {}).get("n") or 0)
+    if n > 0:
+        raise HTTPException(
+            status.HTTP_409_CONFLICT,
+            f"{n} job(s) still reference this source; reassign them first",
+        )
+    db.execute("DELETE FROM lakebridge.sources WHERE id = ?", (source_id,))
+    auth.audit(user, "source.delete", source_id, {"job_count": n})
 
 
 def _open_oracle(row: dict[str, Any], password: str) -> Any:

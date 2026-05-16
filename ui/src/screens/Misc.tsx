@@ -16,6 +16,7 @@ import {
   useAudit,
   useAuthConfig,
   useDeleteJob,
+  useDeleteSource,
   useDevSignIn,
   useJob,
   useJobRuns,
@@ -31,6 +32,7 @@ import {
   useUsers,
 } from '../api/queries';
 import { JobEditor } from './JobEditor';
+import { SourceEditor } from './SourceEditor';
 import {
   formatDuration,
   formatInt,
@@ -867,8 +869,11 @@ export function SourcesScreen({ me }: { me: ApiMe }) {
   const toast = useToast();
   const sources = useSources();
   const test = useTestConnection();
+  const deleteSource = useDeleteSource();
   const [selectedId, setSelectedId] = useState<string | null>(null);
+  const [editorOpen, setEditorOpen] = useState<'new' | 'edit' | null>(null);
   const canWrite = me.role !== 'Read-only';
+  const isAdmin = me.role === 'Admin';
 
   const selected: ApiSource | undefined = sources.data?.find(
     (s) => s.id === (selectedId ?? sources.data[0]?.id),
@@ -881,7 +886,14 @@ export function SourcesScreen({ me }: { me: ApiMe }) {
           <h1 className="text-xl font-semibold tracking-tight text-text dark:text-d-text">
             Sources
           </h1>
-          <Button variant="primary" size="md" iconLeft={<I.plus size={14} />}>
+          <Button
+            variant="primary"
+            size="md"
+            iconLeft={<I.plus size={14} />}
+            disabled={!isAdmin}
+            title={isAdmin ? undefined : 'Admin only'}
+            onClick={() => setEditorOpen('new')}
+          >
             New source
           </Button>
         </div>
@@ -965,8 +977,45 @@ export function SourcesScreen({ me }: { me: ApiMe }) {
                   <StatusBadge status={selected.status} dense />
                 </div>
                 <div className="flex items-center gap-2">
-                  <Button variant="ghost" size="sm" iconLeft={<I.pencil size={12} />}>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    iconLeft={<I.pencil size={12} />}
+                    disabled={!isAdmin}
+                    title={isAdmin ? undefined : 'Admin only'}
+                    onClick={() => setEditorOpen('edit')}
+                  >
                     Edit
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    size="sm"
+                    iconLeft={<I.x size={12} />}
+                    disabled={!isAdmin}
+                    title={isAdmin ? undefined : 'Admin only'}
+                    onClick={() => {
+                      if (
+                        !window.confirm(
+                          `Delete source ${selected.id}? Any jobs referencing it will block this — reassign them first.`,
+                        )
+                      ) {
+                        return;
+                      }
+                      deleteSource.mutate(selected.id, {
+                        onSuccess: () => {
+                          setSelectedId(null);
+                          toast.push({ tone: 'info', title: `Deleted ${selected.id}` });
+                        },
+                        onError: (err: unknown) =>
+                          toast.push({
+                            tone: 'danger',
+                            title: 'Delete failed',
+                            description: err instanceof Error ? err.message : 'Unknown error',
+                          }),
+                      });
+                    }}
+                  >
+                    Delete
                   </Button>
                   <Button
                     variant="secondary"
@@ -1055,6 +1104,22 @@ export function SourcesScreen({ me }: { me: ApiMe }) {
           {selected && <SourceObjectsList sourceId={selected.id} />}
         </div>
       </div>
+      {editorOpen && (
+        <SourceEditor
+          me={me}
+          existing={editorOpen === 'edit' ? selected : undefined}
+          onClose={() => setEditorOpen(null)}
+          onSaved={(s) => {
+            setEditorOpen(null);
+            setSelectedId(s.id);
+            sources.refetch();
+            toast.push({
+              tone: 'success',
+              title: editorOpen === 'edit' ? `Saved ${s.id}` : `Created ${s.id}`,
+            });
+          }}
+        />
+      )}
     </div>
   );
 }

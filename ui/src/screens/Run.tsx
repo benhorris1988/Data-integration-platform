@@ -91,7 +91,9 @@ function RunDetailContent({
   qc: ReturnType<typeof useQueryClient>;
 }) {
   const canWrite = me.role !== 'Read-only';
-  const [tab, setTab] = useState<'summary' | 'errors' | 'recon' | 'log'>('summary');
+  const [tab, setTab] = useState<
+    'summary' | 'errors' | 'quarantine' | 'recon' | 'log'
+  >('summary');
 
   // Polling fallback: when the run is in-flight we re-poll every 2s in case
   // SSE drops; once it's terminal we stop. SSE itself invalidates the cache
@@ -251,12 +253,24 @@ function RunDetailContent({
         <Tabs
           value={tab}
           onChange={(v) => setTab(v as typeof tab)}
-          tabs={[
-            { value: 'summary', label: 'Summary' },
-            { value: 'errors', label: 'Errors', count: errors.data?.length },
-            { value: 'recon', label: 'Reconciliation' },
-            { value: 'log', label: 'Raw log' },
-          ]}
+          tabs={(() => {
+            // Errors and quarantine both live in lakebridge.run_errors;
+            // tease them apart for the badge counts.
+            const all = errors.data ?? [];
+            const errCount = all.filter(
+              (e) => !(e.severity === 'warn' && e.code === 'LB-QUARANTINE'),
+            ).length;
+            const quarCount = all.filter(
+              (e) => e.severity === 'warn' && e.code === 'LB-QUARANTINE',
+            ).length;
+            return [
+              { value: 'summary', label: 'Summary' },
+              { value: 'errors', label: 'Errors', count: errCount },
+              { value: 'quarantine', label: 'Quarantine', count: quarCount },
+              { value: 'recon', label: 'Reconciliation' },
+              { value: 'log', label: 'Raw log' },
+            ];
+          })()}
           right={
             isInFlight ? (
               <span className="text-xs text-text-subtle dark:text-d-text-subtle inline-flex items-center gap-1.5">
@@ -281,7 +295,20 @@ function RunDetailContent({
             />
           )}
           {tab === 'errors' && (
-            <RunErrorsTable errors={errors.data ?? []} isLoading={errors.isPending} />
+            <RunErrorsTable
+              errors={(errors.data ?? []).filter(
+                (e) => !(e.severity === 'warn' && e.code === 'LB-QUARANTINE'),
+              )}
+              isLoading={errors.isPending}
+            />
+          )}
+          {tab === 'quarantine' && (
+            <RunQuarantine
+              errors={(errors.data ?? []).filter(
+                (e) => e.severity === 'warn' && e.code === 'LB-QUARANTINE',
+              )}
+              isLoading={errors.isPending}
+            />
           )}
           {tab === 'recon' && <RunRecon run={r} />}
           {tab === 'log' && <RunRawLog runId={r.id} />}
@@ -676,6 +703,150 @@ function RunErrorsTable({
         <div className="p-3 overflow-auto flex-1">
           <pre className="font-mono text-xs text-text dark:text-d-text whitespace-pre-wrap break-all leading-relaxed">
             {selected ? JSON.stringify(selected, null, 2) : '(no error selected)'}
+          </pre>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function RunQuarantine({
+  errors,
+  isLoading,
+}: {
+  errors: ApiRunError[];
+  isLoading: boolean;
+}) {
+  // Quarantined rows are written to lakebridge.run_errors as
+  // severity='warn'/code='LB-QUARANTINE' with the raw row preserved in
+  // payload_json. This view surfaces them as a row-level diagnostic.
+  const [selected, setSelected] = useState<ApiRunError | null>(errors[0] ?? null);
+  useEffect(() => {
+    if (selected == null && errors[0]) setSelected(errors[0]);
+  }, [errors, selected]);
+
+  if (isLoading) {
+    return (
+      <div className="space-y-2">
+        {Array.from({ length: 6 }).map((_, i) => (
+          <SkeletonBlock key={i} h={20} />
+        ))}
+      </div>
+    );
+  }
+  if (errors.length === 0) {
+    return (
+      <EmptyState
+        icon={<I.check size={20} />}
+        title="No rows quarantined."
+        description="The runner accepted every row this run produced. If quarantine starts to appear on subsequent runs, watch this tab for the value that broke the cast."
+      />
+    );
+  }
+
+  const renderRowPayload = (raw: ApiRunError): string => {
+    if (!raw.payload_json) return '(no payload)';
+    try {
+      const parsed = JSON.parse(raw.payload_json);
+      if (Array.isArray(parsed.columns) && Array.isArray(parsed.row)) {
+        const lines = parsed.columns.map(
+          (c: string, i: number) => `  ${c.padEnd(28)} ${JSON.stringify(parsed.row[i])}`,
+        );
+        return `${parsed.columns.length} columns:\n${lines.join('\n')}`;
+      }
+      return JSON.stringify(parsed, null, 2);
+    } catch {
+      return raw.payload_json;
+    }
+  };
+
+  return (
+    <div className="grid grid-cols-12 gap-4 h-full">
+      <div className="col-span-7 border border-border dark:border-d-border rounded-md bg-surface dark:bg-d-surface overflow-hidden flex flex-col">
+        <div className="px-3 py-2 border-b border-border dark:border-d-border flex items-center justify-between">
+          <div className="text-sm">
+            <span className="font-medium text-text dark:text-d-text">
+              {errors.length} quarantined rows
+            </span>
+            <span className="text-text-muted dark:text-d-text-muted">
+              {' '}· kept out of the target; analyst can replay
+            </span>
+          </div>
+          <Button variant="ghost" size="sm" iconLeft={<I.download size={12} />}>
+            Export
+          </Button>
+        </div>
+        <div className="overflow-auto flex-1">
+          <table className="w-full text-sm" style={{ tableLayout: 'fixed' }}>
+            <colgroup>
+              <col style={{ width: 44 }} />
+              <col />
+              <col style={{ width: 130 }} />
+            </colgroup>
+            <thead>
+              <tr>
+                {['', 'Reason', 'Captured'].map((h, i) => (
+                  <th
+                    key={i}
+                    className="h-8 px-3 text-left text-xs font-medium text-text-muted dark:text-d-text-muted uppercase tracking-wide border-b border-border dark:border-d-border bg-surface dark:bg-d-surface sticky top-0"
+                  >
+                    {h}
+                  </th>
+                ))}
+              </tr>
+            </thead>
+            <tbody>
+              {errors.map((e) => {
+                const active = selected?.id === e.id;
+                return (
+                  <tr
+                    key={e.id}
+                    onClick={() => setSelected(e)}
+                    className={cx(
+                      'border-b border-border dark:border-d-border cursor-pointer',
+                      active
+                        ? 'bg-warning/5 dark:bg-warning/10'
+                        : 'hover:bg-surface-2 dark:hover:bg-d-surface-2',
+                    )}
+                    style={{ height: 32 }}
+                  >
+                    <td className="px-3">
+                      <StatusDot status="warning" />
+                    </td>
+                    <td className="px-3 truncate text-text-muted dark:text-d-text-muted">
+                      {e.message}
+                    </td>
+                    <td className="px-3 text-xs text-text-muted dark:text-d-text-muted">
+                      {formatRelative(e.captured_at)}
+                    </td>
+                  </tr>
+                );
+              })}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      <div className="col-span-5 border border-border dark:border-d-border rounded-md bg-surface dark:bg-d-surface overflow-hidden flex flex-col">
+        <div className="px-3 py-2 border-b border-border dark:border-d-border flex items-center justify-between">
+          <span className="font-mono text-sm text-text dark:text-d-text">
+            Row payload
+          </span>
+          <Button
+            variant="ghost"
+            size="sm"
+            iconLeft={<I.copy size={12} />}
+            onClick={() =>
+              selected?.payload_json &&
+              navigator.clipboard?.writeText(selected.payload_json)
+            }
+          >
+            Copy JSON
+          </Button>
+        </div>
+        <div className="p-3 overflow-auto flex-1">
+          <pre className="font-mono text-xs text-text dark:text-d-text whitespace-pre-wrap break-all leading-relaxed">
+            {selected ? renderRowPayload(selected) : '(no row selected)'}
           </pre>
         </div>
       </div>
