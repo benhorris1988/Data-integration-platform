@@ -21,6 +21,7 @@ import type {
   ApiSource,
   ApiSourceObject,
   ApiTestConnectionResult,
+  ApiWatermarkHistory,
   ApiTimelineEntry,
   ApiUser,
   RunStatus,
@@ -47,6 +48,30 @@ export function useJobs(filters: JobsFilters = {}) {
     queryFn: () =>
       request<ApiJobListItem[]>(`/api/jobs${qs ? `?${qs}` : ''}`),
     staleTime: 10_000,
+  });
+}
+
+export function useJobWatermarkHistory(jobId: number | undefined) {
+  return useQuery({
+    queryKey: ['job-watermark', jobId],
+    queryFn: () =>
+      request<ApiWatermarkHistory>(`/api/jobs/${jobId}/watermark-history`),
+    enabled: jobId !== undefined,
+    staleTime: 30_000,
+  });
+}
+
+export function useResetWatermark() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: ({ jobId, value }: { jobId: number; value: string | null }) =>
+      request<{ value: string | null }>(`/api/jobs/${jobId}/reset-watermark`, {
+        method: 'POST',
+        body: JSON.stringify({ value }),
+      }),
+    onSuccess: (_d, vars) => {
+      qc.invalidateQueries({ queryKey: ['job-watermark', vars.jobId] });
+    },
   });
 }
 

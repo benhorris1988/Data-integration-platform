@@ -40,6 +40,8 @@ def test_openapi_renders_with_all_routers() -> None:
         "/api/jobs/{job_id}/runs",
         "/api/jobs/{job_id}/schema",
         "/api/jobs/{job_id}/pin",
+        "/api/jobs/{job_id}/watermark-history",
+        "/api/jobs/{job_id}/reset-watermark",
         "/api/runs/{run_id}",
         "/api/runs/{run_id}/events",
         "/api/runs/{run_id}/log",

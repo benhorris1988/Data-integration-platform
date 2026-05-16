@@ -558,6 +558,113 @@ def delete_job(
     )
 
 
+class WatermarkAdvance(BaseModel):
+    advanced_at: str
+    advanced_by_run_id: int | None
+    watermark_value: str
+
+
+class WatermarkHistoryResponse(BaseModel):
+    job_id: int
+    watermark_column: str | None
+    current_value: str | None
+    advances: list[WatermarkAdvance]
+
+
+@router.get("/{job_id}/watermark-history", response_model=WatermarkHistoryResponse)
+def get_watermark_history(
+    job_id: int,
+    _: Annotated[auth.User, Depends(auth.current_user)],
+    limit: int = Query(default=50, le=500),
+) -> WatermarkHistoryResponse:
+    """Current watermark + the last N advances for a job.
+
+    Each advance is the `(watermark_after, finished_at, run_id)` from a
+    successful run that bumped the watermark. We read it from `runs`
+    rather than maintaining a separate audit log — keeps the source of
+    truth single-rooted.
+    """
+    job = db.fetch_one(
+        "SELECT id, watermark_column FROM lakebridge.jobs WHERE id = ?", (job_id,)
+    )
+    if job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+    current = db.fetch_one(
+        "SELECT watermark_value FROM lakebridge.watermarks WHERE job_id = ?",
+        (job_id,),
+    )
+    advances = db.fetch_all(
+        f"SELECT TOP {limit} finished_at AS advanced_at, id AS advanced_by_run_id, "
+        "       watermark_after AS watermark_value "
+        "FROM lakebridge.runs "
+        "WHERE job_id = ? AND status = N'succeeded' AND watermark_after IS NOT NULL "
+        "  AND run_mode <> N'backfill' "
+        "ORDER BY finished_at DESC",
+        (job_id,),
+    )
+    return WatermarkHistoryResponse(
+        job_id=int(job["id"]),
+        watermark_column=job["watermark_column"],
+        current_value=current["watermark_value"] if current else None,
+        advances=[WatermarkAdvance.model_validate(a) for a in advances],
+    )
+
+
+class ResetWatermarkBody(BaseModel):
+    # New value to set. Empty string clears the watermark (next run reads
+    # all rows). Operators sometimes want this when an upstream backfill
+    # restated old data.
+    value: str | None = None
+
+
+@router.post("/{job_id}/reset-watermark")
+def reset_watermark(
+    job_id: int,
+    body: ResetWatermarkBody,
+    user: Annotated[auth.User, Depends(auth.RequireOperator)],
+) -> dict[str, str | None]:
+    """Force the live watermark to `body.value` (or clear it). The next
+    scheduled or manual run will read from that point forward."""
+    job = db.fetch_one(
+        "SELECT id, code, watermark_column FROM lakebridge.jobs WHERE id = ?",
+        (job_id,),
+    )
+    if job is None:
+        raise HTTPException(status.HTTP_404_NOT_FOUND, "job not found")
+    if job["watermark_column"] is None:
+        raise HTTPException(
+            status.HTTP_400_BAD_REQUEST,
+            "job does not use a watermark — nothing to reset",
+        )
+    if body.value:
+        db.execute(
+            """
+            MERGE lakebridge.watermarks AS t
+            USING (SELECT ? AS job_id, ? AS watermark_column, ? AS watermark_value) AS s
+              ON t.job_id = s.job_id
+            WHEN MATCHED THEN
+                UPDATE SET watermark_value = s.watermark_value,
+                           advanced_by_run_id = NULL,
+                           advanced_at = SYSUTCDATETIME()
+            WHEN NOT MATCHED THEN
+                INSERT (job_id, watermark_column, watermark_value, advanced_at)
+                VALUES (s.job_id, s.watermark_column, s.watermark_value, SYSUTCDATETIME());
+            """,
+            (job_id, job["watermark_column"], body.value),
+        )
+    else:
+        db.execute(
+            "DELETE FROM lakebridge.watermarks WHERE job_id = ?", (job_id,)
+        )
+    auth.audit(
+        user,
+        "job.reset_watermark",
+        str(job["code"]),
+        {"job_id": job_id, "new_value": body.value},
+    )
+    return {"value": body.value}
+
+
 class PinBody(BaseModel):
     pinned: bool
 

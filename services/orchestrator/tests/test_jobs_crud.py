@@ -223,6 +223,48 @@ def test_delete_requires_admin(
     assert r.status_code == 403
 
 
+def test_reset_watermark_validates(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    csrf = _signin(client, "marcus.hahn@corp.local")
+    from lakebridge import db as dbmod
+
+    # Job exists but has no watermark column → 400.
+    monkeypatch.setattr(
+        dbmod, "fetch_one",
+        lambda *_a, **_kw: {"id": 1, "code": "X", "watermark_column": None},
+    )
+    r = client.post(
+        "/api/jobs/1/reset-watermark",
+        json={"value": "2026-05-16T00:00:00Z"},
+        headers={"X-Lakebridge-Csrf": csrf},
+    )
+    assert r.status_code == 400
+    assert "watermark" in r.json()["detail"]
+
+    # Now with a watermark column → 200.
+    monkeypatch.setattr(
+        dbmod, "fetch_one",
+        lambda *_a, **_kw: {"id": 1, "code": "X", "watermark_column": "MODIFIED_DATE"},
+    )
+    r = client.post(
+        "/api/jobs/1/reset-watermark",
+        json={"value": "2026-05-16T00:00:00Z"},
+        headers={"X-Lakebridge-Csrf": csrf},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"value": "2026-05-16T00:00:00Z"}
+
+    # Clearing (value=null) also works.
+    r = client.post(
+        "/api/jobs/1/reset-watermark",
+        json={"value": None},
+        headers={"X-Lakebridge-Csrf": csrf},
+    )
+    assert r.status_code == 200
+    assert r.json() == {"value": None}
+
+
 def test_pin_round_trips(
     client: TestClient, monkeypatch: pytest.MonkeyPatch
 ) -> None:

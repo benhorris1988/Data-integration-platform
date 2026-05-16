@@ -255,6 +255,19 @@ export type ApiSourceObject = {
   last_analyzed: string | null;
 };
 
+export type ApiWatermarkAdvance = {
+  advanced_at: string;
+  advanced_by_run_id: number | null;
+  watermark_value: string;
+};
+
+export type ApiWatermarkHistory = {
+  job_id: number;
+  watermark_column: string | null;
+  current_value: string | null;
+  advances: ApiWatermarkAdvance[];
+};
+
 // Per-run reconciliation result for the Run detail Recon tab.
 export type ApiReconBucket = {
   bucket: string;

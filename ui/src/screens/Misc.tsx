@@ -20,7 +20,9 @@ import {
   useJob,
   useJobRuns,
   useJobSchema,
+  useJobWatermarkHistory,
   useReconMatrix,
+  useResetWatermark,
   useRunJob,
   useSourceObjects,
   useSources,
@@ -191,6 +193,7 @@ export function JobDetail({
               canWrite={canWrite}
               isAdmin={isAdmin}
               onEdit={() => setEditing(true)}
+              onJumpToWatermarks={() => setTab('watermarks')}
               onDelete={(force) =>
                 j &&
                 deleteJob.mutate(
@@ -236,7 +239,7 @@ export function JobDetail({
           {tab === 'history' && j && (
             <JobHistory jobId={j.id} jobCode={j.code} onOpenRun={onOpenRun} />
           )}
-          {tab === 'watermarks' && j && <JobWatermarks job={j} />}
+          {tab === 'watermarks' && j && <JobWatermarks job={j} canWrite={canWrite} />}
         </div>
       </div>
       {backfillOpen && j && (
@@ -374,6 +377,7 @@ function JobConfig({
   isAdmin,
   onEdit,
   onDelete,
+  onJumpToWatermarks,
 }: {
   job: ApiJob | undefined;
   isLoading: boolean;
@@ -381,6 +385,7 @@ function JobConfig({
   isAdmin: boolean;
   onEdit: () => void;
   onDelete: (force: boolean) => void;
+  onJumpToWatermarks: () => void;
 }) {
   if (isLoading || !job) {
     return (
@@ -469,8 +474,15 @@ function JobConfig({
               size="sm"
               className="w-full justify-start"
               iconLeft={<I.refresh size={12} />}
-              disabled
-              title="Watermark reset is pending (manual SQL update for now)"
+              disabled={!job?.watermark_column || !canWrite}
+              title={
+                !job?.watermark_column
+                  ? 'No watermark on this job'
+                  : canWrite
+                  ? undefined
+                  : 'Read-only role'
+              }
+              onClick={onJumpToWatermarks}
             >
               Reset watermark
             </Button>
@@ -721,41 +733,130 @@ function JobHistory({
   );
 }
 
-function JobWatermarks({ job }: { job: ApiJob }) {
+function JobWatermarks({ job, canWrite }: { job: ApiJob; canWrite: boolean }) {
+  const toast = useToast();
+  const history = useJobWatermarkHistory(job.id);
+  const reset = useResetWatermark();
+
+  if (!job.watermark_column) {
+    return (
+      <EmptyState
+        icon={<I.info size={20} />}
+        title="This job doesn’t use a watermark."
+        description={`Strategy is ${job.strategy} — every run reads the whole source.`}
+      />
+    );
+  }
+
+  if (history.isPending) {
+    return (
+      <div className="space-y-2">
+        {Array.from({ length: 6 }).map((_, i) => (
+          <SkeletonBlock key={i} h={32} />
+        ))}
+      </div>
+    );
+  }
+  if (history.isError) {
+    return (
+      <InlineBanner
+        tone="danger"
+        title="Could not load watermark history."
+        description={history.error instanceof Error ? history.error.message : 'Unknown error'}
+      />
+    );
+  }
+
+  const h = history.data!;
+  const onReset = () => {
+    const v = window.prompt(
+      `Reset watermark for ${job.code}.\n\nNew value (leave blank to clear; the next run will read all rows):`,
+      h.current_value ?? '',
+    );
+    if (v === null) return; // user cancelled
+    const newValue = v.trim() === '' ? null : v.trim();
+    reset.mutate(
+      { jobId: job.id, value: newValue },
+      {
+        onSuccess: () =>
+          toast.push({
+            tone: 'info',
+            title: `Watermark ${newValue ? 'set' : 'cleared'}`,
+            description: newValue ?? '(empty)',
+          }),
+        onError: (err: unknown) =>
+          toast.push({
+            tone: 'danger',
+            title: 'Reset failed',
+            description: err instanceof Error ? err.message : 'Unknown error',
+          }),
+      },
+    );
+  };
+
   return (
     <div className="grid grid-cols-12 gap-4">
       <div className="col-span-7 border border-border dark:border-d-border rounded-md bg-surface dark:bg-d-surface">
         <div className="px-4 py-2.5 border-b border-border dark:border-d-border">
-          <h3 className="text-base font-medium text-text dark:text-d-text">Watermark</h3>
+          <h3 className="text-base font-medium text-text dark:text-d-text">
+            Current watermark
+          </h3>
         </div>
         <div className="p-4">
-          {job.watermark_column ? (
-            <>
-              <div className="text-xs text-text-muted dark:text-d-text-muted uppercase tracking-wide">
-                {job.watermark_column}
-              </div>
-              <div className="mt-1 font-mono text-xl text-text dark:text-d-text">
-                see most recent run
-              </div>
-              <div className="mt-1 text-xs text-text-subtle dark:text-d-text-subtle">
-                Strategy: {job.strategy}
-              </div>
-            </>
-          ) : (
-            <EmptyState
-              icon={<I.info size={20} />}
-              title="This job doesn’t use a watermark."
-              description={`Strategy is ${job.strategy} — every run reads the whole source.`}
-            />
-          )}
+          <div className="text-xs text-text-muted dark:text-d-text-muted uppercase tracking-wide">
+            {h.watermark_column}
+          </div>
+          <div className="mt-1 font-mono text-xl text-text dark:text-d-text">
+            {h.current_value ?? '(unset — next run reads everything)'}
+          </div>
+          <div className="mt-1 text-xs text-text-subtle dark:text-d-text-subtle">
+            Strategy: {job.strategy}
+          </div>
+          <div className="mt-4 flex items-center gap-2">
+            <Button
+              variant="secondary"
+              size="sm"
+              iconLeft={<I.refresh size={12} />}
+              disabled={!canWrite}
+              title={canWrite ? undefined : 'Read-only role'}
+              loading={reset.isPending}
+              onClick={onReset}
+            >
+              Set / reset
+            </Button>
+          </div>
         </div>
       </div>
-      <div className="col-span-5 border border-border dark:border-d-border rounded-md bg-surface dark:bg-d-surface p-4">
-        <InlineBanner
-          tone="info"
-          title="Watermark history view pending."
-          description="GET /api/jobs/:id/watermark-history isn’t built yet. The orchestrator already records advances in lakebridge.watermarks."
-        />
+      <div className="col-span-5 border border-border dark:border-d-border rounded-md bg-surface dark:bg-d-surface">
+        <div className="px-4 py-2.5 border-b border-border dark:border-d-border">
+          <h3 className="text-base font-medium text-text dark:text-d-text">
+            Recent advances
+          </h3>
+        </div>
+        {h.advances.length === 0 ? (
+          <div className="px-4 py-8 text-center text-sm text-text-muted dark:text-d-text-muted">
+            No watermark advances recorded yet.
+          </div>
+        ) : (
+          <ul>
+            {h.advances.slice(0, 20).map((a, i) => (
+              <li
+                key={`${a.advanced_at}-${i}`}
+                className="px-4 py-2 flex items-center justify-between text-sm border-t border-border dark:border-d-border first:border-t-0"
+              >
+                <span className="font-mono text-text dark:text-d-text">
+                  {a.watermark_value}
+                </span>
+                <span className="font-mono text-xs text-text-muted dark:text-d-text-muted">
+                  run #{a.advanced_by_run_id ?? '—'}
+                </span>
+                <span className="font-mono text-xs tabular text-text-muted dark:text-d-text-muted">
+                  {formatRelative(a.advanced_at)}
+                </span>
+              </li>
+            ))}
+          </ul>
+        )}
       </div>
     </div>
   );
